@@ -98,6 +98,26 @@ func _poll_socket() -> void:
 					])
 				_process_commands()
 
+		# Poll the async execute_lua thread (wedge fix). Runs off the main
+		# thread so long turns don't block client servicing. Thread.is_alive()
+		# is true while running; when it goes false the thread has finished.
+		if _lua_in_flight and _lua_thread != null:
+			if not _lua_thread.is_alive():
+				_lua_in_flight = false
+				_lua_done = true  # result delivered below
+				_lua_thread = null
+
+		# Deliver a completed async execute_lua result (wedge fix).
+		if _lua_done and _client != null:
+			_lua_done = false
+			var lua_resp: Dictionary
+			if _lua_ok:
+				lua_resp = {"jsonrpc": "2.0", "id": _lua_pending_id,
+					"result": {"value": _variant_to_serializable(_lua_result), "type": _variant_type_name(_lua_result)}}
+			else:
+				lua_resp = _make_error(_lua_pending_id, -32000, "Lua error: " + _lua_error)
+			_send_response(lua_resp)
+
 		# Flush pending log notifications (from thread-safe Logger queue)
 		if _log_collector != null:
 			var pending: Array[String] = _log_collector.flush_pending()
@@ -171,6 +191,10 @@ func _handle_request(line: String) -> void:
 		if params is Dictionary:
 			handler_params = params.duplicate()
 		handler_params["__id"] = id
+		if method == "execute_lua":
+			var lua_params: Dictionary = params if (params is Dictionary) else {}
+			_start_lua_async(id, str(lua_params.get("code", "")))
+			return
 		response = _dispatch(method, handler_params)
 		if "id" not in response:
 			response["id"] = id
@@ -218,6 +242,17 @@ var _log_collector: Logger = null
 var _handlers: Dictionary
 var _debug_verbose: bool = false
 
+# Async execute_lua variables (wedge fix)
+var _lua_thread: Thread = null
+var _lua_in_flight: bool = false
+var _lua_done: bool = false
+var _lua_ok: bool = false
+var _lua_result: Variant = null
+var _lua_error: String = ""
+var _lua_pending_id: Variant = null
+var _lua_vm: Node = null
+var _lua_code: String = ""
+
 ## Extract node path from params, accepting both "path" and "node_path" keys.
 func _get_node_path_param(params: Dictionary, default: String = "") -> String:
 	if params.has("path"):
@@ -251,7 +286,7 @@ func _init_handlers() -> void:
 		"inject_input_event":  _cmd_inject_input_event,
 		"graceful_quit":       _cmd_graceful_quit,
 		"game_status":         _cmd_game_status,
-		# "execute_lua":         _cmd_execute_lua,  # Removed: Lua support is optional. Enable lua-gdextension to use Lua commands.
+		"execute_lua":         _cmd_execute_lua,
 		"toggle_verbose":      _cmd_toggle_verbose,
 		"list_handlers":       _cmd_list_handlers,
 		"get_godot_logs":      _cmd_get_godot_logs,
@@ -885,18 +920,43 @@ func _cmd_game_status(_params: Dictionary) -> Dictionary:
 		"in_combat": in_combat,
 	}}
 
-# func _cmd_execute_lua(params: Dictionary) -> Dictionary:
-# 	# Lua support is optional. This handler is disabled if lua-gdextension is not enabled.
-# 	var code: String = str(params.get("code", ""))
-# 	if code.is_empty():
-# 		return _make_error(params.get("__id", null), -32602, "Lua code string required (pass 'code' parameter)")
-# 	var lua_vm: Node = get_node_or_null("/root/LuaVM")
-# 	if lua_vm == null:
-# 		return _make_error(params.get("__id", null), -32602, "LuaVM autoload not found")
-# 	var result: Variant = lua_vm.call("execute_string", code)
-# 	if result == null:
-# 		return {"result": {"value": null, "note": "Lua returned null (may indicate error, check game log)"}}
-# 	return {"result": {"value": _variant_to_serializable(result), "type": _variant_type_name(result)}}
+func _cmd_execute_lua(params: Dictionary) -> Dictionary:
+	_start_lua_async(params.get("__id", null), str(params.get("code", "")))
+	return {}  # response already sent by _start_lua_async (ack or error)
+
+func _start_lua_async(id: Variant, code: String) -> void:
+	if code.is_empty():
+		_send_response(_make_error(id, -32602, "Lua code string required (pass 'code' parameter)"))
+		return
+	if _lua_in_flight:
+		_send_response(_make_error(id, -32001, "execute_lua busy: a previous call is still running"))
+		return
+	var lua_vm: Node = get_node_or_null("/root/LuaVM")
+	if lua_vm == null:
+		_send_response(_make_error(id, -32602, "LuaVM autoload not found"))
+		return
+	# No early line is sent. The ONLY response for this request is the final
+	# result, delivered by _poll_socket once the background thread finishes.
+	# The proxy (120s timeout) simply waits for that one line.
+	_lua_in_flight = true
+	_lua_done = false
+	_lua_ok = false
+	_lua_result = null
+	_lua_error = ""
+	_lua_pending_id = id
+	_lua_vm = lua_vm
+	_lua_code = code
+	_lua_thread = Thread.new()
+	_lua_thread.start(_lua_thread_main)
+	# NOTE: do NOT wait_for_completion() here — that would block the main
+	# thread and reproduce the wedge. _poll_socket polls the thread instead.
+
+func _lua_thread_main() -> void:
+	# Runs on the background thread. execute_string returns the result directly.
+	var r: Variant = _lua_vm.call("execute_string", _lua_code)
+	_lua_result = r
+	_lua_ok = true
+	_lua_error = ""
 
 func _cmd_toggle_verbose(params: Dictionary) -> Dictionary:
 	var new_value: bool = ! _debug_verbose
