@@ -67,6 +67,7 @@ func _log_error(
 
 	_mutex.lock()
 	_messages.append(entry)
+	_maybe_mark_crash(entry)
 	_append_pending(_format_notification("error", entry))
 	if _messages.size() > _max_lines:
 		_messages.remove_at(0)
@@ -81,6 +82,55 @@ func get_messages() -> Array[String]:
 func clear_messages() -> void:
 	_mutex.lock()
 	_messages.clear()
+	_mutex.unlock()
+
+## Set when a fatal / crash-indicating pattern is seen in an error. Lets the
+## bridge and CLI detect that the game is in a broken state (crash, segfault,
+## abort) without re-scanning the whole log.
+var _crash_detected: bool = false
+var _last_crash: String = ""
+
+const _CRASH_PATTERNS: Array[String] = [
+	"SCRIPT ERROR", "Parse Error", "Compile Error", "crash", "Crash",
+	"CRASH", "SIGSEGV", "SIGABRT", "Segmentation", "abort", "Aborted",
+	"Invalid assignment", "Invalid call", "Invalid get", "Invalid set",
+	"Null instance", "Attempting to call", "Cannot call",
+]
+
+## Record a candidate crash (called from _log_error). Sets _crash_detected and
+## captures the most recent crash text. Must be called with _mutex held.
+func _maybe_mark_crash(entry: String) -> void:
+	for pat: String in _CRASH_PATTERNS:
+		if entry.find(pat) >= 0:
+			_crash_detected = true
+			_last_crash = entry
+			return
+
+## Return the most recent N crash/error entries (ERROR / SCRIPT ERROR / crash
+## patterns). Used by the `game crashes` / `query crashes` commands so a crash
+## can be read without dumping the whole log.
+func get_crashes(max_lines: int = 50) -> Dictionary:
+	_mutex.lock()
+	var out: Array[String] = []
+	for i in range(_messages.size() - 1, -1, -1):
+		var m: String = _messages[i]
+		if m.find("[ERROR]") >= 0 or m.find("[SCRIPT ERROR]") >= 0 \
+			or m.find("CRASH") >= 0 or m.find("crash") >= 0:
+			out.append(m)
+			if out.size() >= max_lines:
+				break
+	var result: Dictionary = {
+		"crash_detected": _crash_detected,
+		"last_crash": _last_crash,
+		"errors": out,
+	}
+	_mutex.unlock()
+	return result
+
+func reset_crash() -> void:
+	_mutex.lock()
+	_crash_detected = false
+	_last_crash = ""
 	_mutex.unlock()
 
 ## Append a pending notification, dropping the oldest when over the cap.

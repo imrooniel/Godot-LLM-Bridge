@@ -98,25 +98,12 @@ func _poll_socket() -> void:
 					])
 				_process_commands()
 
-		# Poll the async execute_lua thread (wedge fix). Runs off the main
-		# thread so long turns don't block client servicing. Thread.is_alive()
-		# is true while running; when it goes false the thread has finished.
-		if _lua_in_flight and _lua_thread != null:
-			if not _lua_thread.is_alive():
-				_lua_in_flight = false
-				_lua_done = true  # result delivered below
-				_lua_thread = null
-
-		# Deliver a completed async execute_lua result (wedge fix).
-		if _lua_done and _client != null:
-			_lua_done = false
-			var lua_resp: Dictionary
-			if _lua_ok:
-				lua_resp = {"jsonrpc": "2.0", "id": _lua_pending_id,
-					"result": {"value": _variant_to_serializable(_lua_result), "type": _variant_type_name(_lua_result)}}
-			else:
-				lua_resp = _make_error(_lua_pending_id, -32000, "Lua error: " + _lua_error)
-			_send_response(lua_resp)
+		# NOTE: execute_lua now runs INLINE on the main thread (in
+		# _cmd_execute_lua), so there is no background thread to poll and no
+		# deferred result to deliver here. The old async thread-polling block
+		# (the "wedge fix") is retired — it made Lua-driven Godot calls fail
+		# ("caller thread can't call ... on this node"), breaking the
+		# presentation layer. See _cmd_execute_lua for the rationale.
 
 		# Flush pending log notifications (from thread-safe Logger queue)
 		if _log_collector != null:
@@ -192,10 +179,12 @@ func _handle_request(line: String) -> void:
 			handler_params = params.duplicate()
 		handler_params["__id"] = id
 		if method == "execute_lua":
-			var lua_params: Dictionary = params if (params is Dictionary) else {}
-			_start_lua_async(id, str(lua_params.get("code", "")))
-			return
-		response = _dispatch(method, handler_params)
+			# Route through the same inline (main-thread) handler as the
+			# registered _handlers entry. Runs the Lua on the main thread so
+			# Lua-driven Godot calls (presentation, highlights, UI) work.
+			response = _cmd_execute_lua(handler_params)
+		else:
+			response = _dispatch(method, handler_params)
 		if "id" not in response:
 			response["id"] = id
 		response["jsonrpc"] = "2.0"
@@ -242,16 +231,12 @@ var _log_collector: Logger = null
 var _handlers: Dictionary
 var _debug_verbose: bool = false
 
-# Async execute_lua variables (wedge fix)
-var _lua_thread: Thread = null
+# --- execute_lua single-flight guard ---
+# execute_lua runs INLINE on the main thread (see _cmd_execute_lua). The Lua VM
+# is single-threaded, so at most one eval runs at a time; a concurrent request
+# gets a "busy" error. _lua_in_flight is set for the duration of the inline
+# call to enforce this.
 var _lua_in_flight: bool = false
-var _lua_done: bool = false
-var _lua_ok: bool = false
-var _lua_result: Variant = null
-var _lua_error: String = ""
-var _lua_pending_id: Variant = null
-var _lua_vm: Node = null
-var _lua_code: String = ""
 
 ## Extract node path from params, accepting both "path" and "node_path" keys.
 func _get_node_path_param(params: Dictionary, default: String = "") -> String:
@@ -283,6 +268,7 @@ func _init_handlers() -> void:
 		"press_button":        _cmd_press_button,
 		"get_scene_info":      _cmd_get_scene_info,
 		"set_time_scale":      _cmd_set_time_scale,
+		"change_scene":        _cmd_change_scene,
 		"inject_input_event":  _cmd_inject_input_event,
 		"graceful_quit":       _cmd_graceful_quit,
 		"game_status":         _cmd_game_status,
@@ -291,6 +277,8 @@ func _init_handlers() -> void:
 		"list_handlers":       _cmd_list_handlers,
 		"get_godot_logs":      _cmd_get_godot_logs,
 		"clear_godot_logs":    _cmd_clear_godot_logs,
+		"get_crashes":         _cmd_get_crashes,
+		"clear_crashes":       _cmd_clear_crashes,
 	}
 
 func _init_log_collector() -> void:
@@ -810,6 +798,20 @@ func _cmd_set_time_scale(params: Dictionary) -> Dictionary:
 	Engine.time_scale = scale
 	return {"result": {"ok": true, "time_scale": Engine.time_scale}}
 
+## Change scene from the MAIN thread. Unlike execute_lua (which runs on a
+## background thread after the wedge fix), this handler runs on the game's main
+## thread via _process_commands, so get_tree().change_scene_to_file() works.
+## Needed to drive a real combat match: set GameSession.combat_config first
+## (game set), then change-scene to combat.tscn so _start_from_config reads it.
+func _cmd_change_scene(params: Dictionary) -> Dictionary:
+	var path: String = str(params.get("path", ""))
+	if path.is_empty():
+		return _make_error(params.get("__id", null), -32602, "scene path required (pass 'path' parameter)")
+	var ok: Error = get_tree().change_scene_to_file(path)
+	if ok != OK:
+		return _make_error(params.get("__id", null), -32601, "change_scene_to_file failed: " + error_string(ok))
+	return {"result": {"ok": true, "scene": path}}
+
 func _cmd_find_nodes(params: Dictionary) -> Dictionary:
 	var root_path: String = str(params.get("root", "root"))
 	var name_pattern: String = str(params.get("name_pattern", "*"))
@@ -920,43 +922,84 @@ func _cmd_game_status(_params: Dictionary) -> Dictionary:
 		"in_combat": in_combat,
 	}}
 
+# --- execute_lua (main-thread) --------------------------------------------
+## Handler entry point (kept in _init_handlers). Runs the Lua INLINE on the
+## MAIN thread. This is correct: combat actions (targeting, highlights,
+## animation presentation, UI) call Godot node methods that MUST run on the
+## main thread — a background thread makes them fail with "The caller thread
+## can't call the function on this node". The old background-thread "wedge
+## fix" is retired: it wedged because the editor proxy timeout was 10s while a
+## long turn blocked the main thread; that timeout is now 120s and the editor's
+## heartbeat is independent of the game, so a normal turn (a few seconds)
+## completes well within the deadline and the response is delivered inline.
+## A concurrent request is still rejected (single-flight Lua VM).
 func _cmd_execute_lua(params: Dictionary) -> Dictionary:
-	_start_lua_async(params.get("__id", null), str(params.get("code", "")))
-	return {}  # response already sent by _start_lua_async (ack or error)
-
-func _start_lua_async(id: Variant, code: String) -> void:
+	var id: Variant = params.get("__id", null)
+	var code: String = str(params.get("code", ""))
 	if code.is_empty():
-		_send_response(_make_error(id, -32602, "Lua code string required (pass 'code' parameter)"))
-		return
+		return _make_error(id, -32602, "Lua code string required (pass 'code' parameter)")
 	if _lua_in_flight:
-		_send_response(_make_error(id, -32001, "execute_lua busy: a previous call is still running"))
-		return
+		return _make_error(id, -32001, "execute_lua busy: a previous call is still running")
 	var lua_vm: Node = get_node_or_null("/root/LuaVM")
 	if lua_vm == null:
-		_send_response(_make_error(id, -32602, "LuaVM autoload not found"))
-		return
-	# No early line is sent. The ONLY response for this request is the final
-	# result, delivered by _poll_socket once the background thread finishes.
-	# The proxy (120s timeout) simply waits for that one line.
-	_lua_in_flight = true
-	_lua_done = false
-	_lua_ok = false
-	_lua_result = null
-	_lua_error = ""
-	_lua_pending_id = id
-	_lua_vm = lua_vm
-	_lua_code = code
-	_lua_thread = Thread.new()
-	_lua_thread.start(_lua_thread_main)
-	# NOTE: do NOT wait_for_completion() here — that would block the main
-	# thread and reproduce the wedge. _poll_socket polls the thread instead.
+		return _make_error(id, -32602, "LuaVM autoload not found")
 
-func _lua_thread_main() -> void:
-	# Runs on the background thread. execute_string returns the result directly.
-	var r: Variant = _lua_vm.call("execute_string", _lua_code)
-	_lua_result = r
-	_lua_ok = true
-	_lua_error = ""
+	_lua_in_flight = true
+	var out: Dictionary = _run_lua_wrapped(lua_vm, code)
+	_lua_in_flight = false
+
+	if out.get("error", "") != "":
+		var resp: Dictionary = _make_error(id, -32000,
+			(str(out.get("error_kind", "lua")) + " error: ") + str(out["error"]))
+		resp["result"] = {"stdout": out.get("stdout", "")}
+		return resp
+	return {"jsonrpc": "2.0", "id": id,
+		"result": {"value": _variant_to_serializable(out.get("value", null)),
+			"type": _variant_type_name(out.get("value", null)),
+			"stdout": out.get("stdout", "")}}
+
+## Run Lua code (synchronously, on the calling thread) wrapped so that:
+##  - Lua `print()` output is captured into the returned "stdout" (a plain
+##    print from a non-UI context is unreliable; capture makes it deterministic).
+##  - Any Lua error is caught and reported (not a crash), with "error_kind".
+##  - A clean `return nil` is distinguished from an error.
+## Returns {value=..., stdout=..., error=..., error_kind=...}.
+## The prelude + user code + epilogue MUST be ONE execute_string chunk: `lua.
+## do_string` does not persist a global `print` override across separate calls.
+func _run_lua_wrapped(lua_vm: Node, code: String) -> Dictionary:
+	var wrapped: String = "local _orig_print = print local _cap = {} local _cn = 0 "
+	wrapped = wrapped + "print = function(...) _cn = _cn + 1 local p = {} "
+	wrapped = wrapped + "for i = 1, select('#', ...) do p[i] = tostring(select(i, ...)) end "
+	wrapped = wrapped + "table.insert(_cap, table.concat(p, ' ')) "
+	wrapped = wrapped + "if _cn >= 5000 then print = _orig_print return end end "
+	wrapped = wrapped + "local function _run() "
+	wrapped = wrapped + code
+	wrapped = wrapped + " end "
+	wrapped = wrapped + "local ok, val = pcall(_run) "
+	wrapped = wrapped + "local err = '' if not ok then err = tostring(val) end "
+	wrapped = wrapped + "print = _orig_print "
+	wrapped = wrapped + "return { value = ok and val or nil, stdout = table.concat(_cap, '\\n'), error = err }"
+
+	var r: Variant = lua_vm.call("execute_string", wrapped)
+
+	var out: Dictionary = {"value": null, "stdout": "", "error": "", "error_kind": "lua"}
+	if r is LuaError:
+		out["error"] = "wrapper failed: " + str(r.message)
+		return out
+
+	var table_d: Dictionary = {}
+	if r is Dictionary:
+		table_d = r
+	elif r is Array:
+		table_d = {}
+
+	out["stdout"] = str(table_d.get("stdout", ""))
+	var err_s: String = str(table_d.get("error", ""))
+	out["value"] = table_d.get("value", null)
+	if err_s != "":
+		out["error"] = err_s
+		out["error_kind"] = "lua"
+	return out
 
 func _cmd_toggle_verbose(params: Dictionary) -> Dictionary:
 	var new_value: bool = ! _debug_verbose
@@ -1001,6 +1044,21 @@ func _cmd_clear_godot_logs(params: Dictionary) -> Dictionary:
 		return _make_error(params.get("__id", null), -32602, "Log collector not initialized")
 
 	_log_collector.clear_messages()
+	return {"result": {"ok": true}}
+
+## Return recent crash/error entries + a crash_detected flag, so a crash can be
+## read without dumping the whole log. Complements the DAP `debugger state`
+## (breaked=true often means a crash/exception).
+func _cmd_get_crashes(params: Dictionary) -> Dictionary:
+	if _log_collector == null:
+		return _make_error(params.get("__id", null), -32602, "Log collector not initialized")
+	var max_lines: int = int(params.get("max_lines", 50))
+	return {"result": _log_collector.get_crashes(max_lines)}
+
+func _cmd_clear_crashes(_params: Dictionary) -> Dictionary:
+	if _log_collector == null:
+		return _make_error(_params.get("__id", null), -32602, "Log collector not initialized")
+	_log_collector.reset_crash()
 	return {"result": {"ok": true}}
 
 func _exit_tree() -> void:
