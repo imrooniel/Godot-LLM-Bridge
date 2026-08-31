@@ -6,7 +6,7 @@ extends Node
 #
 # Only active in debug builds. Zero overhead in exports.
 
-const _LogCollectorScript := preload("res://debug_log_collector.gd")
+const _LogCollectorScript := preload("res://autoloads/debug_log_collector.gd")
 const DEFAULT_PORT := 5555
 const MAX_PORT_ATTEMPTS := 10
 const REQUEST_TIMEOUT_SECS := 60.0
