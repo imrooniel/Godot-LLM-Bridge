@@ -42,6 +42,13 @@ var breaked: bool = false    # game paused (stopped seen, no continued yet)
 var _want_attached: bool = false
 var _game_active: bool = false
 
+## Most recent `stopped` event detail (reason/text), so the CLI can surface the
+## pause reason in state.json without a separate RPC. Cleared on continued /
+## game stop. reason is one of: "paused" | "exception" | "breakpoint" | "step"
+## (engine: debug_adapter_parser.cpp ev_stopped_*). For "exception" the engine
+## puts the actual error message in `text`.
+var last_stopped: Dictionary = {}
+
 var _pending: Dictionary = {}    # seq -> mailbox_id ("" = internal request)
 var _seq: int = 0
 var _queue: Array = []           # {id, command, args, ...} waiting to send
@@ -228,6 +235,7 @@ func on_game_stopped() -> void:
 	_game_active = false
 	attached = false
 	breaked = false
+	last_stopped = {}
 	_want_attached = false
 	_queue.clear()
 	_in_flight = {}
@@ -575,9 +583,17 @@ func _on_event(event: String, body: Variant) -> void:
 				data["hit_breakpoint_ids"] = body.get("hitBreakpointIds")
 			if body.has("text"):
 				data["text"] = str(body.get("text"))
+			# Persist the pause detail so state.json (and thus a failed game
+			# command's inline report) can show WHY the game froze.
+			last_stopped = {
+				"reason": data.get("reason", ""),
+				"text": data.get("text", ""),
+				"at_ms": Time.get_ticks_msec(),
+			}
 			_emit("debugger_stopped", data)
 		"continued":
 			breaked = false
+			last_stopped = {}
 			_emit("debugger_continued", {"thread_id": int(body.get("threadId", 1))})
 		"output":
 			var line: String = str(body.get("output", "")).strip_edges()
@@ -591,6 +607,7 @@ func _on_event(event: String, body: Variant) -> void:
 		"terminated":
 			attached = false
 			breaked = false
+			last_stopped = {}
 			_want_attached = false
 			_emit("debugger_terminated", {})
 		"exited":
@@ -636,6 +653,7 @@ func get_state() -> Dictionary:
 		"port": port,
 		"attached": attached,
 		"breaked": breaked,
+		"last_stopped": last_stopped,
 		"game_active": _game_active,
 		"breakpoint_count": _count_breakpoints(),
 		"pending_requests": _pending.size(),

@@ -157,6 +157,22 @@ class EditorBridgeClient:
         data["heartbeat_age_s"] = round(max(age, 0.0), 2)
         return data
 
+    def read_state_retry(self, attempts: int = 6, interval_s: float = 0.05):
+        """read_state() that tolerates a racy/partial state.json read.
+
+        The editor rewrites state.json atomically every ~250 ms; a single open()
+        can land mid-rename and hit a JSONDecodeError (-> None). On the failure
+        path (a game command just timed out) we specifically need a trustworthy
+        state, so retry a few times before giving up.
+        """
+        state = None
+        for _ in range(max(1, attempts)):
+            state = self.read_state()
+            if state:
+                return state
+            time.sleep(interval_s)
+        return state
+
     def ping(self):
         state = self.read_state()
         if not state or not state.get("alive"):
@@ -318,6 +334,148 @@ def _resolve_user_path(path: str) -> str:
     if path and path.startswith("user://"):
         return os.path.join(_project_user_dir(), path[len("user://"):])
     return path
+
+
+def _print_game_unreachable(err: "EditorBridgeError") -> None:
+    """When a game command can't reach the DebugBridge, report WHY — seamlessly.
+
+    The in-game DebugBridge (127.0.0.1:5555) only answers while the game is
+    running AND unpaused. When it's unreachable we read the editor's own view of
+    the game state (state.json) and branch:
+
+      * process exited   -> crash report (re-run scene-play, read panel logs).
+      * paused at a break/exception (debugger.breaked == True) -> the game is
+        frozen, which is why the 5555 bridge is silent. We investigate INLINE:
+        auto-attach to the DAP session, fetch the stack + pause reason + a tail
+        of the DAP output, and print it all here. The caller needs no extra
+        commands to see the error.
+      * alive but not breaked -> bridge dropped / mid-restart.
+
+    A single racy state.json read can't derail the report: we retry the read.
+    Any auto-investigation step that fails degrades gracefully to the manual tips.
+    """
+    print("Error: %s" % err, file=sys.stderr)
+    state = {}
+    client = None
+    try:
+        client = EditorBridgeClient()
+        state = client.read_state_retry() or {}
+    except Exception:
+        state = {}
+    game = state.get("game", {}) if isinstance(state, dict) else {}
+    running = game.get("running")
+    scene = game.get("playing_scene")
+    dbg = state.get("debugger", {}) if isinstance(state, dict) else {}
+    breaked = dbg.get("breaked")
+
+    print("\n--- game bridge unreachable; editor view ---", file=sys.stderr)
+    print("  game_running:      %s" % running, file=sys.stderr)
+    print("  playing_scene:     %s" % scene, file=sys.stderr)
+    print("  debugger_breaked:  %s" % breaked, file=sys.stderr)
+
+    if not running:
+        print(
+            "  => the game PROCESS EXITED. It likely crashed. Re-run with "
+            "`action scene-play` and check `logs get --source panel` "
+            "or the editor console for the crash error.", file=sys.stderr)
+        _print_debugger_tip()
+        return
+
+    if breaked:
+        _report_paused_game(client, state)
+        return
+
+    print(
+        "  => the game process is alive but its DebugBridge dropped and it is "
+        "NOT paused (breaked=False). It may be mid-restart; retry in a few "
+        "seconds, or `action scene-stop` then `action scene-play`.", file=sys.stderr)
+    _print_debugger_tip()
+
+
+def _print_debugger_tip() -> None:
+    print("  Tip: `debugger state` shows DAP state; `logs get --source panel` "
+          "has the editor console.", file=sys.stderr)
+
+
+def _report_paused_game(client, state: dict) -> None:
+    """Game is paused at a break/exception. Investigate inline via DAP.
+
+    The 5555 in-game bridge is silent because the game loop is frozen, but the
+    editor's DAP session can still read the paused stack. We auto-attach, fetch
+    the stack + pause reason + a log tail, and print them so the caller sees the
+    error without issuing separate debugger commands.
+    """
+    print(
+        "  => the game is ALIVE but PAUSED (a runtime break/exception froze it; "
+        "that's why the 5555 bridge is silent). Investigating via DAP...",
+        file=sys.stderr)
+
+    dbg = state.get("debugger", {}) if isinstance(state, dict) else {}
+    last_stopped = dbg.get("last_stopped") or {}
+    if last_stopped:
+        reason = last_stopped.get("reason", "")
+        text = last_stopped.get("text", "")
+        line = "  pause reason:      %s" % reason
+        if text:
+            line += "  —  %s" % text
+        print(line, file=sys.stderr)
+
+    if client is None:
+        try:
+            client = EditorBridgeClient()
+        except Exception:
+            client = None
+
+    # 1) Auto-attach (no-op if already attached).
+    attached = dbg.get("attached")
+    try:
+        if not attached:
+            client.rpc("action.debugger.attach", {}, timeout=15)
+            print("  [auto] attached to the DAP session.", file=sys.stderr)
+    except Exception as e:
+        print("  [auto] attach failed: %s" % e, file=sys.stderr)
+
+    # 2) Fetch the stack (async on the engine side; the bridge waits for the dump).
+    frames = []
+    try:
+        resp = client.rpc("query.debugger.stack", {}, timeout=30)
+        frames = resp.get("stackFrames", []) if isinstance(resp, dict) else []
+    except Exception as e:
+        print("  [auto] stack fetch failed: %s" % e, file=sys.stderr)
+    if frames:
+        print("\n  --- paused stack (top frame first) ---", file=sys.stderr)
+        for i, fr in enumerate(frames[:25]):
+            src = fr.get("source", {}) or {}
+            name = src.get("name", "?")
+            path = src.get("path", "")
+            line_no = int(fr.get("line", 0)) if fr.get("line") is not None else 0
+            func = fr.get("name", "")
+            prefix = "  > " if i == 0 else "    "
+            print("%s%s:%d  in %s" % (prefix, name, line_no, func), file=sys.stderr)
+            if path and i == 0:
+                print("%s    %s" % ("    ", path), file=sys.stderr)
+
+    # 3) Tail of the DAP output (game console + error context).
+    try:
+        resp = client.rpc("query.debugger.output", {"max_lines": 40}, timeout=15)
+        lines = resp.get("messages", []) if isinstance(resp, dict) else []
+        if lines:
+            print("\n  --- last %d DAP output lines (game console) ---"
+                  % len(lines), file=sys.stderr)
+            for ln in lines:
+                print("  | %s" % str(ln).replace("\n", " ⏎ "), file=sys.stderr)
+    except Exception as e:
+        print("  [auto] output fetch failed: %s" % e, file=sys.stderr)
+
+    print("\n  To investigate:  `debugger vars` / `debugger eval '<expr>'` / "
+          "`debugger step-over`", file=sys.stderr)
+    print("  To resume the game:  `debugger continue`   (or `action scene-stop`)",
+          file=sys.stderr)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -634,10 +792,14 @@ def main() -> None:
             method, params = GAME_COMMANDS[args.game_command]
             params = params(args)
             timeout = GAME_TIMEOUTS.get(args.game_command, DEFAULT_TIMEOUT)
-            result = client.rpc("game." + method, params, timeout=timeout)
-            if args.game_command in ("screenshot",):
-                result["local_path"] = _resolve_user_path(args.path)
-            print(json.dumps(result, indent=2))
+            try:
+                result = client.rpc("game." + method, params, timeout=timeout)
+                if args.game_command in ("screenshot",):
+                    result["local_path"] = _resolve_user_path(args.path)
+                print(json.dumps(result, indent=2))
+            except EditorBridgeError as e:
+                _print_game_unreachable(e)
+                sys.exit(1)
 
         elif args.command == "debugger":
             client.ping()
