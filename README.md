@@ -1,6 +1,6 @@
 # Godot LLM Bridge
 
-**EditorBridge + DebugBridge** — A file-mailbox bridge between the Godot editor and external CLI tools/LLMs for programmatic game state inspection, UI interaction, and real DAP debugging. Works purely with GDScript and Godot nodes by default; Lua support via `lua-gdextension` is optional.
+**EditorBridge + DebugBridge** — Something to make your llm less blind and more capable of interacting with godot editor as it works with you on the project. A file-mailbox bridge between the Godot editor and external CLI tools/LLMs for programmatic game state inspection, UI interaction, and real DAP debugging. Works purely with GDScript and Godot nodes by default; Lua support via `lua-gdextension` is optional.
 
 ## 🌟 Key Features
 
