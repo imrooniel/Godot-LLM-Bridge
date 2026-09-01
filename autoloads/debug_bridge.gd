@@ -6,7 +6,7 @@ extends Node
 #
 # Only active in debug builds. Zero overhead in exports.
 
-const _LogCollectorScript := preload("res://autoloads/debug_log_collector.gd")
+const _LogCollectorScript := preload("res://debug_log_collector.gd")
 const DEFAULT_PORT := 5555
 const MAX_PORT_ATTEMPTS := 10
 const REQUEST_TIMEOUT_SECS := 60.0
@@ -18,11 +18,11 @@ var _buffer: String = ""
 var _bound_port: int = 0
 var _client_connect_time_ms: int = 0
 var _poll_timer: Timer
+var _lua_vm: Node = null
 
 func _ready() -> void:
-	# Bypass OS.is_debug_build() check for LLM extension testing
-	# if not OS.is_debug_build():
-	# 	return
+	if not OS.is_debug_build():
+		return
 
 	# Ensure this autoload always runs even when scene is paused
 	process_mode = Node.PROCESS_MODE_ALWAYS
@@ -108,7 +108,7 @@ func _poll_socket() -> void:
 		# Flush pending log notifications (from thread-safe Logger queue)
 		if _log_collector != null:
 			var pending: Array[String] = _log_collector.flush_pending()
-			for notif_text: String in pending:
+			for notif_text in pending:
 				_send_log_notification(notif_text)
 
 		var idle_ms := Time.get_ticks_msec() - _client_connect_time_ms
@@ -182,10 +182,19 @@ func _handle_request(line: String) -> void:
 			# Route through the same inline (main-thread) handler as the
 			# registered _handlers entry. Runs the Lua on the main thread so
 			# Lua-driven Godot calls (presentation, highlights, UI) work.
-			response = _cmd_execute_lua(handler_params)
+			response = await _cmd_execute_lua(handler_params)
 		else:
-			response = _dispatch(method, handler_params)
-		if "id" not in response:
+			# await supports both sync handlers (returns their value directly) and
+			# coroutine handlers like start_scene (polls across frames) without
+			# special-casing. _handle_request becomes a coroutine; the single
+			# in-flight command is processed sequentially by _process_commands.
+			response = await _dispatch(method, handler_params)
+		# Contract: handlers MUST return either a bare value or a partial envelope
+		# {"result": ...} / {"error": ...} — never a full JSON-RPC envelope
+		# ({"jsonrpc","id","result"}). A full envelope would carry id=null here and
+		# get double-stamped, so we stamp the id only when it is missing/null and
+		# set jsonrpc once, keeping a single authoritative envelope.
+		if response.get("id", null) == null:
 			response["id"] = id
 		response["jsonrpc"] = "2.0"
 
@@ -269,6 +278,7 @@ func _init_handlers() -> void:
 		"get_scene_info":      _cmd_get_scene_info,
 		"set_time_scale":      _cmd_set_time_scale,
 		"change_scene":        _cmd_change_scene,
+		"start_scene":         _cmd_start_scene,
 		"inject_input_event":  _cmd_inject_input_event,
 		"graceful_quit":       _cmd_graceful_quit,
 		"game_status":         _cmd_game_status,
@@ -299,11 +309,22 @@ func _clear_logs_for_session() -> void:
 func register_handler(method_name: String, handler: Callable) -> void:
 	_handlers[method_name] = handler
 
+## Game-specific wiring: register the Lua engine used by execute_lua.
+## The generic core knows nothing about which autoload provides it.
+func set_lua_vm(lua_vm: Node) -> void:
+	_lua_vm = lua_vm
+
+func has_lua_vm() -> bool:
+	return _lua_vm != null and is_instance_valid(_lua_vm)
+
 func _has_handler(method: String) -> bool:
 	return method in _handlers
 
+## Dispatch a registered handler. A coroutine: `await`-ing the handler call supports
+## both sync handlers (return their value directly) and async/coroutine handlers
+## (e.g. start_scene) by resolving their result. ALL call sites must `await _dispatch`.
 func _dispatch(method: String, params: Dictionary) -> Dictionary:
-	return _handlers[method].call(params)
+	return await _handlers[method].call(params)
 
 func _resolve_node(path: String) -> Dictionary:
 	"""Returns {node: Node} or {error: String}."""
@@ -801,8 +822,8 @@ func _cmd_set_time_scale(params: Dictionary) -> Dictionary:
 ## Change scene from the MAIN thread. Unlike execute_lua (which runs on a
 ## background thread after the wedge fix), this handler runs on the game's main
 ## thread via _process_commands, so get_tree().change_scene_to_file() works.
-## Needed to drive a real combat match: set GameSession.combat_config first
-## (game set), then change-scene to combat.tscn so _start_from_config reads it.
+## Game-specific: callers typically set a match/config on a session autoload
+## first (via `game set`), then change-scene to the scene that reads it.
 func _cmd_change_scene(params: Dictionary) -> Dictionary:
 	var path: String = str(params.get("path", ""))
 	if path.is_empty():
@@ -811,6 +832,84 @@ func _cmd_change_scene(params: Dictionary) -> Dictionary:
 	if ok != OK:
 		return _make_error(params.get("__id", null), -32601, "change_scene_to_file failed: " + error_string(ok))
 	return {"result": {"ok": true, "scene": path}}
+
+## Generic: change scene then poll a readiness probe across frames until true
+## or timeout. Probe forms (no game knowledge):
+##   {node: "/root/X"}                       -> node exists + is_instance_valid
+##   {node: "/root/X", prop: "p", equals: v} -> node exists and get(p) == v
+##   {handler: "my_probe"}                   -> call registered handler, read its bool
+func _cmd_start_scene(params: Dictionary) -> Dictionary:
+	var path: String = str(params.get("path", ""))
+	if path.is_empty():
+		return _make_error(params.get("__id", null), -32602, "scene path required (pass 'path' parameter)")
+	var probe: Dictionary = {}
+	if params.has("ready_probe"):
+		probe = params["ready_probe"]
+	if not (probe is Dictionary) or probe.is_empty():
+		return _make_error(params.get("__id", null), -32602, "ready_probe required: {node} | {node,prop,equals} | {handler}")
+	var timeout_s: float = float(params.get("timeout_s", 8.0))
+	var poll_ms: int = int(params.get("poll_ms", 100))
+
+	var change_ok: Error = get_tree().change_scene_to_file(path)
+	if change_ok != OK:
+		return _make_error(params.get("__id", null), -32601, "change_scene_to_file failed: " + error_string(change_ok))
+
+	var start_ms: int = Time.get_ticks_msec()
+	var waited_ms: int = 0
+	var last_probe: Variant = null
+	var ready: bool = false
+	var poll_s: float = maxf(float(poll_ms) / 1000.0, 0.016)
+	while true:
+		await get_tree().create_timer(poll_s).timeout
+		last_probe = await _eval_probe(probe)
+		ready = (last_probe == true)
+		waited_ms = Time.get_ticks_msec() - start_ms
+		if ready or waited_ms >= int(timeout_s * 1000.0):
+			break
+	return {"result": {"scene": path, "ready": ready, "waited_ms": waited_ms, "probe": last_probe}}
+
+## Evaluate a readiness probe. Returns true/false.
+## A coroutine: `await`-ing _dispatch supports both sync probe handlers (return their
+## value directly) and async probe handlers (poll Lua/state across frames). The probe
+## handler should return a bool or {"live": bool} / {"ready": bool}.
+func _eval_probe(probe: Dictionary) -> bool:
+	if probe.has("handler"):
+		var hname: String = str(probe["handler"])
+		if not _has_handler(hname):
+			return false
+		var res: Variant = await _dispatch(hname, {})
+		if res is Dictionary:
+			var r: Dictionary = res
+			if r.has("result"):
+				var inner: Variant = r["result"]
+				if inner is Dictionary and inner.has("live"):
+					return (inner["live"] is bool) and inner["live"]
+				if inner is Dictionary and inner.has("ready"):
+					return (inner["ready"] is bool) and inner["ready"]
+				if inner is bool:
+					return inner
+			if r.has("error"):
+				return false
+		# Bare bool result (e.g. a probe returning true/false directly).
+		# Only compare when res is actually a bool; anything else (Dictionary,
+		# null, Number) is not-ready. (GDScript 4.x rejects == between
+		# incompatible types, so the type guard is required.)
+		if res is bool:
+			return res
+		return false
+	# node-based probe
+	var node_path: String = str(probe.get("node", ""))
+	if node_path.is_empty():
+		return false
+	var node: Node = get_node_or_null(node_path)
+	if node == null or not is_instance_valid(node):
+		return false
+	if probe.has("prop"):
+		var prop: String = str(probe["prop"])
+		if not node.has_property(prop):
+			return false
+		return node.get(prop) == probe.get("equals")
+	return true
 
 func _cmd_find_nodes(params: Dictionary) -> Dictionary:
 	var root_path: String = str(params.get("root", "root"))
@@ -940,12 +1039,12 @@ func _cmd_execute_lua(params: Dictionary) -> Dictionary:
 		return _make_error(id, -32602, "Lua code string required (pass 'code' parameter)")
 	if _lua_in_flight:
 		return _make_error(id, -32001, "execute_lua busy: a previous call is still running")
-	var lua_vm: Node = get_node_or_null("/root/LuaVM")
-	if lua_vm == null:
-		return _make_error(id, -32602, "LuaVM autoload not found")
+	if not has_lua_vm():
+		return _make_error(id, -32602,
+			"no Lua engine registered (call DebugBridge.set_lua_vm(node))")
 
 	_lua_in_flight = true
-	var out: Dictionary = _run_lua_wrapped(lua_vm, code)
+	var out: Dictionary = _run_lua_wrapped(_lua_vm, code)
 	_lua_in_flight = false
 
 	if out.get("error", "") != "":
