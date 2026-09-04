@@ -1,0 +1,6 @@
+# Godot import artifacts (regenerated on every filesystem scan)
+*.import
+
+# Python bytecode from the bridge CLI
+__pycache__/
+*.pyc
