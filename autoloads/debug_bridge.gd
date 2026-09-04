@@ -327,13 +327,22 @@ func _dispatch(method: String, params: Dictionary) -> Dictionary:
 	return await _handlers[method].call(params)
 
 func _resolve_node(path: String) -> Dictionary:
-	"""Returns {node: Node} or {error: String}."""
-	if path.is_empty() or path == "root":
+	"""Returns {node: Node} or {error: String}.
+	Accepts paths relative to the root window (the form scan-ui / find-nodes
+	return, e.g. "MatchScreen/StatusBar") AND absolute "/root/..." forms —
+	both resolve identically."""
+	var rel: String = path
+	if rel.begins_with("/root/"):
+		rel = rel.trim_prefix("/root/")
+	if rel == "" or rel == "root":
 		return {"node": get_tree().root}
-	var full_path: String = "/root/" + path
+	if rel.begins_with("root/"):
+		rel = rel.trim_prefix("root/")
+	var full_path: String = "/root/" + rel
 	var node: Node = get_node_or_null(full_path)
 	if node == null:
-		return {"error": "Node not found: " + full_path}
+		return {"error": "Node not found: " + full_path
+			+ " (from path '%s'; use root-relative paths as returned by scan-ui)" % path}
 	return {"node": node}
 
 func _cmd_ping(_params: Dictionary) -> Dictionary:

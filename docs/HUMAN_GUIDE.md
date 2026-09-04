@@ -41,6 +41,10 @@ The CLI is the primary interface for interacting with the Godot editor and game:
 # Launch editor and wait for bridge readiness
 python scripts/editor_bridge_cli.py launch
 
+# Restart editor reliably (quit + wait + launch; preferred over the engine's
+# own editor-restart, whose relaunch can fail silently)
+python scripts/editor_bridge_cli.py restart
+
 # Check editor liveness (heartbeat)
 python scripts/editor_bridge_cli.py ping
 

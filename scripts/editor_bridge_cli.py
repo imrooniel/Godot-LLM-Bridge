@@ -51,6 +51,7 @@ LAUNCH_MARKER_PREFIX = "=== EditorBridge launch"
 DEFAULT_TIMEOUT = 30.0
 LIVE_WINDOW_S = 2.0      # heartbeat younger than this = editor alive
 LAUNCH_DEADLINE_S = 300.0  # first run after an engine upgrade reimports everything
+BINARY_CONFIG = os.path.join(PROJECT_ROOT, ".godot-editor-path")
 
 
 class EditorBridgeError(Exception):
@@ -62,10 +63,30 @@ class EditorBridgeNotRunning(Exception):
 
 
 def _find_godot_binary():
-    """Find the Godot 4.x editor binary. Returns None if not found."""
+    """Find the Godot 4.x editor binary. Returns None if not found.
+
+    Order: GODOT_EDITOR_BINARY env var → project-local .godot-editor-path
+    (one line, absolute or relative to the project root — the recommended
+    setup for custom builds; machine-local, keep it out of git) → PATH →
+    registry → common install locations.
+    """
     env = os.environ.get("GODOT_EDITOR_BINARY")
     if env and os.path.exists(env):
         return env
+
+    try:
+        with open(BINARY_CONFIG) as f:
+            cfg = f.read().strip().strip('"').strip("'")
+        if cfg:
+            cfg = cfg if os.path.isabs(cfg) else os.path.join(PROJECT_ROOT, cfg)
+            if os.path.exists(cfg):
+                return cfg
+            print("Warning: %s points to a missing binary: %s (falling back to "
+                  "auto-detection)" % (BINARY_CONFIG, cfg), file=sys.stderr)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print("Warning: cannot read %s: %s" % (BINARY_CONFIG, e), file=sys.stderr)
 
     import shutil
     for name in ("godot", "godot4", "Godot", "godot-editor"):
@@ -135,6 +156,32 @@ def _parse_value(value: str):
         return value
 
 
+def _resolved_path(args) -> str:
+    """Path supplied as a positional and/or --path (both spellings accepted)."""
+    pos = getattr(args, "path_pos", None)
+    flag = getattr(args, "path", None)
+    if pos and flag and pos != flag:
+        raise SystemExit("path given twice (positional vs --path): %r vs %r"
+                         % (pos, flag))
+    resolved = pos or flag or ""
+    if not resolved:
+        raise SystemExit("a scene path is required (positional or --path)")
+    return resolved
+
+
+def _parse_json_params(raw: str) -> dict:
+    """Parse a --json-params value into a dict. Empty/None -> {}."""
+    if raw is None or raw.strip() == "":
+        return {}
+    try:
+        val = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--json-params is not valid JSON: {e}")
+    if not isinstance(val, dict):
+        raise SystemExit("--json-params must be a JSON object ({...})")
+    return val
+
+
 class EditorBridgeClient:
     """File-mailbox client. Every call is self-contained (no persistent
     connection to manage) — parallel invocations are safe by construction."""
@@ -174,7 +221,11 @@ class EditorBridgeClient:
         return state
 
     def ping(self):
-        state = self.read_state()
+        # read_state_retry, not read_state: the editor rewrites state.json
+        # every ~250 ms (tmp + rename) and a single open() can land mid-rename
+        # (Windows sharing violation -> OSError -> None). A transient read
+        # miss is NOT a dead editor — retry the read before declaring it so.
+        state = self.read_state_retry()
         if not state or not state.get("alive"):
             raise EditorBridgeNotRunning(
                 "editor not reachable (no fresh heartbeat in %s)" % STATE_FILE)
@@ -189,23 +240,38 @@ class EditorBridgeClient:
                       {"id": req_id, "cmd": cmd, "args": args or {}, "timeout": timeout})
         out_path = os.path.join(OUTBOX_DIR, req_id + ".json")
         deadline = time.time() + timeout
+        unreadable = 0
         while time.time() < deadline:
             if os.path.exists(out_path):
+                data = None
                 try:
                     with open(out_path) as f:
                         data = json.load(f)
-                finally:
-                    try:
-                        os.unlink(out_path)
-                    except OSError:
-                        pass
+                except (OSError, ValueError):
+                    # The editor writes responses with a tmp file + rename;
+                    # on Windows an open() landing inside the replace window
+                    # hits a transient sharing violation (PermissionError) or
+                    # a partial read. The request WAS processed — retry the
+                    # READ, never re-send, and never delete an unreadable
+                    # response (that would destroy a successful result; the
+                    # editor's orphan purge cleans leftovers).
+                    unreadable += 1
+                    time.sleep(0.05)
+                    continue
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass  # readable; a failed unlink is harmless (orphan purge)
                 if not data.get("ok"):
                     err = data.get("error", {})
                     raise EditorBridgeError("%s: %s" % (cmd, err.get("message", err)))
                 return {k: v for k, v in data.items() if k not in ("id", "ok")}
             time.sleep(0.02)
         raise EditorBridgeError(
-            "%s: timed out after %.0fs (is the editor alive? try 'ping')" % (cmd, timeout))
+            "%s: timed out after %.0fs (is the editor alive? try 'ping')%s"
+            % (cmd, timeout,
+               " — response file appeared but was never readable (%d attempts)"
+               % unreadable if unreadable else ""))
 
     # --- launch -----------------------------------------------------------
 
@@ -219,7 +285,8 @@ class EditorBridgeClient:
         binary = _find_godot_binary()
         if not binary:
             print("Error: Godot binary not found.", file=sys.stderr)
-            print("Set GODOT_EDITOR_BINARY env var or install Godot 4.x.", file=sys.stderr)
+            print("Set GODOT_EDITOR_BINARY env var, write the binary path to %s,"
+                  " or install Godot 4.x." % BINARY_CONFIG, file=sys.stderr)
             sys.exit(1)
 
         cmd = [binary, "--editor", "--path", project_path or PROJECT_ROOT]
@@ -266,6 +333,42 @@ class EditorBridgeClient:
             sys.stderr.write("".join(lines[-n:]))
         except OSError:
             pass
+
+    # --- restart ----------------------------------------------------------
+
+    def restart(self, project_path=None) -> dict:
+        """CLI-owned editor restart: quit, wait for death, launch.
+
+        Never trust the engine's own restart (EditorInterface.restart_editor
+        = save + quit, and the relaunch is a best-effort spawn whose failure
+        is silently dropped — main.cpp:5327 ignores create_instance's Error):
+        the editor can stay dead with no trace. Here the CLI remains the one
+        thing that ever starts the editor (the launch contract).
+        """
+        state = self.read_state()
+        if state and state.get("alive"):
+            print("Asking the editor to quit...", file=sys.stderr)
+            try:
+                self.rpc("action.editor.close", {}, timeout=10)
+            except (EditorBridgeError, EditorBridgeNotRunning) as e:
+                print("close request not acknowledged (%s) — waiting anyway" % e,
+                      file=sys.stderr)
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                st = self.read_state()
+                if not st or not st.get("alive"):
+                    break
+                time.sleep(0.25)
+            else:
+                print("Error: editor still alive 30s after the quit request — a "
+                      "modal dialog (unsaved scene / running project) is likely "
+                      "blocking shutdown. Inspect with `query dialogs` and "
+                      "`action dialog-accept`, then retry.", file=sys.stderr)
+                sys.exit(1)
+            print("Editor stopped.", file=sys.stderr)
+        else:
+            print("Editor not running — launching directly.", file=sys.stderr)
+        return self.launch(project_path)
 
     # --- subscribe / listen -----------------------------------------------
 
@@ -516,12 +619,16 @@ GAME_COMMANDS = {
                                                    "unhandled": a.unhandled}),
     "click-node":      ("click_node", lambda a: {"path": a.path, "button": a.button}),
     "time-scale":      ("set_time_scale", lambda a: {"scale": a.scale}),
+    "change-scene":    ("change_scene", lambda a: {"path": a.path}),
     "quit":            ("graceful_quit", lambda a: {}),
     "clear-logs":      ("clear_godot_logs", lambda a: {}),
+    "crashes":         ("get_crashes", lambda a: {"max_lines": a.max_lines}),
+    "clear-crashes":   ("clear_crashes", lambda a: {}),
 }
 
 # Game requests that can legitimately take longer.
-GAME_TIMEOUTS = {"lua-eval": 60.0, "screenshot": 30.0, "screenshot-b64": 30.0}
+SLOW_GAME_OP_TIMEOUT = 120.0
+GAME_TIMEOUTS = {"lua-eval": SLOW_GAME_OP_TIMEOUT, "screenshot": 30.0, "screenshot-b64": 30.0}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -529,6 +636,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("launch", help="Start the editor and wait for it")
+    subparsers.add_parser("restart",
+                          help="Reliable restart: quit + wait + launch (preferred "
+                               "over 'action editor-restart', which is the engine's "
+                               "silent-failure quit+spawn)")
     subparsers.add_parser("ping", help="Check editor liveness (heartbeat)")
     subparsers.add_parser("connect", help="Verify the editor is reachable, print state")
 
@@ -553,7 +664,8 @@ def build_parser() -> argparse.ArgumentParser:
     a = subparsers.add_parser("action")
     a_sub = a.add_subparsers(dest="action_type", required=True)
     asa = a_sub.add_parser("scene-open")
-    asa.add_argument("path")
+    asa.add_argument("path_pos", nargs="?", default=None, metavar="path")
+    asa.add_argument("--path", default=None, help="alias for the positional path")
     ascl = a_sub.add_parser("scene-close")
     ascl.add_argument("path", nargs="?", default="")
     asv = a_sub.add_parser("scene-save")
@@ -563,10 +675,16 @@ def build_parser() -> argparse.ArgumentParser:
     asp.add_argument("--path", default=None)
     a_sub.add_parser("scene-stop")
     asr = a_sub.add_parser("scene-reload")
-    asr.add_argument("path")
+    asr.add_argument("path_pos", nargs="?", default=None, metavar="path")
+    asr.add_argument("--path", default=None, help="alias for the positional path")
     a_sub.add_parser("editor-restart")
     a_sub.add_parser("editor-close")
     a_sub.add_parser("scripts-reload")
+    afs = a_sub.add_parser("fs-scan",
+                           help="Rescan the editor filesystem — REQUIRED to register "
+                                "new class_name scripts (scripts-reload cannot)")
+    afs.add_argument("--wait", action="store_true",
+                     help="Block until the scan finishes (polls query state)")
     asr1o = a_sub.add_parser("scripts-reload-one")
     asr1o.add_argument("path")
     ada = a_sub.add_parser("dialog-accept",
@@ -637,10 +755,19 @@ def build_parser() -> argparse.ArgumentParser:
     gclick.add_argument("--button", type=int, default=1)
     gts = g_sub.add_parser("time-scale")
     gts.add_argument("scale", type=float)
+    gcs = g_sub.add_parser("change-scene", help="Change scene on the MAIN thread (runs combat._start_from_config)")
+    gcs.add_argument("path")
+    grpc = g_sub.add_parser("rpc", help="Forward an arbitrary registered bridge method (core or game-registered)")
+    grpc.add_argument("method", help="Registered method name, e.g. combat_start_match, combat_snapshot, start_scene")
+    grpc.add_argument("--json-params", dest="json_params", default="",
+                      help="JSON object of named params, e.g. '{\"x\": 3}'")
     g_sub.add_parser("quit")
     glua_act = g_sub.add_parser("lua-eval-act")
     glua_act.add_argument("code")
     g_sub.add_parser("clear-logs")
+    gcr = g_sub.add_parser("crashes", help="Read recent crash/error entries + crash flag")
+    gcr.add_argument("--max-lines", dest="max_lines", type=int, default=50)
+    g_sub.add_parser("clear-crashes", help="Reset the crash-detected flag")
 
     d = subparsers.add_parser(
         "debugger",
@@ -707,6 +834,9 @@ def main() -> None:
         if args.command == "launch":
             state = client.launch()
             print(json.dumps(state, indent=2))
+        elif args.command == "restart":
+            state = client.restart()
+            print(json.dumps(state, indent=2))
         elif args.command in ("ping", "connect"):
             state = client.ping()
             print(json.dumps(state, indent=2))
@@ -737,10 +867,11 @@ def main() -> None:
         elif args.command == "action":
             state = client.ping()
             if args.action_type == "scene-open":
-                if args.path in state.get("scenes", {}).get("open", []):
-                    print("Scene already open: %s" % args.path, file=sys.stderr)
+                path = _resolved_path(args)
+                if path in state.get("scenes", {}).get("open", []):
+                    print("Scene already open: %s" % path, file=sys.stderr)
                     sys.exit(1)
-                result = client.rpc("action.scene.open", {"path": args.path})
+                result = client.rpc("action.scene.open", {"path": path})
             elif args.action_type == "scene-close":
                 result = client.rpc("action.scene.close", {"path": args.path})
             elif args.action_type == "scene-save":
@@ -757,15 +888,34 @@ def main() -> None:
             elif args.action_type == "scene-stop":
                 result = client.rpc("action.scene.stop", {})
             elif args.action_type == "scene-reload":
-                result = client.rpc("action.scene.reload", {"path": args.path})
+                result = client.rpc("action.scene.reload",
+                                    {"path": _resolved_path(args)})
             elif args.action_type == "editor-restart":
                 result = client.rpc("action.editor.restart", {}, timeout=10)
             elif args.action_type == "editor-close":
                 result = client.rpc("action.editor.close", {}, timeout=10)
             elif args.action_type == "scripts-reload":
-                result = client.rpc("action.scripts.reload", {}, timeout=120)
+                result = client.rpc("action.scripts.reload", {}, timeout=SLOW_GAME_OP_TIMEOUT)
             elif args.action_type == "scripts-reload-one":
                 result = client.rpc("action.scripts.reload_one", {"path": args.path})
+            elif args.action_type == "fs-scan":
+                result = client.rpc("action.fs.scan", {}, timeout=30)
+                if args.wait and result.get("ok", True):
+                    deadline = time.time() + 120.0
+                    while True:
+                        time.sleep(0.3)
+                        try:
+                            st = client.rpc("query.state", timeout=10)
+                        except (EditorBridgeError, EditorBridgeNotRunning):
+                            st = None  # editor mid-scan and slow to answer; retry
+                        if st is not None and not st.get("fs_scanning"):
+                            break
+                        if time.time() >= deadline:
+                            result["scan_timeout"] = True
+                            print("Warning: scan still running after 120s",
+                                  file=sys.stderr)
+                            break
+                    result["scan_finished"] = not result.get("scan_timeout")
             elif args.action_type == "dialog-accept":
                 result = client.rpc("action.editor.dialog.accept",
                                     {"ok_button": args.ok_button})
@@ -789,17 +939,36 @@ def main() -> None:
                     out["game_bridge_note"] = str(e)
                 print(json.dumps(out, indent=2))
                 return
+            if args.game_command == "rpc":
+                method = args.method
+                params = _parse_json_params(args.json_params)
+                # Combat ops (start_scene with its readiness poll, combat_start_match
+                # which loads a scene + waits for live, combat_step which waits for
+                # animation) can exceed the 30 s default; give rpc the slow-op budget
+                # (same as lua-eval) so a slow-but-valid op isn't killed early.
+                rpc_timeout = SLOW_GAME_OP_TIMEOUT
+                try:
+                    result = client.rpc("game." + method, params, timeout=rpc_timeout)
+                except EditorBridgeError as e:
+                    _print_game_unreachable(e)
+                    sys.exit(1)
+                print(json.dumps(result, indent=2))
+                return
             method, params = GAME_COMMANDS[args.game_command]
             params = params(args)
             timeout = GAME_TIMEOUTS.get(args.game_command, DEFAULT_TIMEOUT)
             try:
                 result = client.rpc("game." + method, params, timeout=timeout)
-                if args.game_command in ("screenshot",):
-                    result["local_path"] = _resolve_user_path(args.path)
-                print(json.dumps(result, indent=2))
             except EditorBridgeError as e:
+                # The game bridge is unreachable. This commonly means the game
+                # process crashed (or is mid-restart). Surface crash context:
+                # the editor's view of the game + the last crash it captured, so
+                # the user sees WHY instead of a bare "unreachable".
                 _print_game_unreachable(e)
                 sys.exit(1)
+            if args.game_command in ("screenshot",):
+                result["local_path"] = _resolve_user_path(args.path)
+            print(json.dumps(result, indent=2))
 
         elif args.command == "debugger":
             client.ping()

@@ -29,7 +29,7 @@ extends EditorPlugin
 ##
 ## Only active in editor mode. Zero overhead in exports.
 
-const VERSION := "2.1.0"
+const VERSION := "2.2.0"
 
 # Helper modules (preloaded — the addon does not register global class_names).
 const BridgeContextScript := preload("res://addons/editor_bridge/bridge_context.gd")
