@@ -1,3 +1,8 @@
+---
+name: editor-bridge
+description: Use when driving the Godot editor from the terminal — launching the editor, opening/saving/playing/stopping scenes, querying editor state or the scene tree, reading editor logs, subscribing to events, or debugging via DAP. Trigger keywords: EditorBridge, editor_bridge_cli.py, launch, ping, query state, scene-open, scene-play, scene-stop, scene-save, debugger, subscribe, "Godot editor", file-mailbox bridge, editor bridge.
+---
+
 # Agent Skill: EditorBridge
 
 The EditorBridge is a **file-mailbox bridge** between CLI tools and the Godot editor (`addons/editor_bridge/`). No sockets in the editor: requests and responses are JSON files under `.tmp/bridge/`, so there are no half-open connections, no leaked ports, and crashed clients leave only orphan files (auto-purged). The human uses the editor UI normally at the same time — no conflicts.

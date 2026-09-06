@@ -64,7 +64,7 @@ python scripts/editor_bridge_cli.py game get-many Main/Player --props global_pos
 ## 📚 Documentation
 
 - [Human Guide](docs/HUMAN_GUIDE.md) — Installation, usage, and key features for game developers and CI/CD engineers.
-- [Agent Skills](docs/AGENT_SKILLS/) — Documentation for LLMs and AI agents (`editor-bridge.md`, `debug-bridge.md`, `drive.md`).
+- **Agent Skills** (auto-detected by opencode) — live under `.opencode/skills/`: `editor-bridge/SKILL.md`, `debug-bridge/SKILL.md`, `drive/SKILL.md`. Each is a standard opencode skill (YAML frontmatter + body) so an opencode session in this project picks them up automatically.
 - [Bridge Improvement Plan](docs/bridge-improvement-plan.md) — Design rationale and verification for the closed-loop driving features.
 
 ## 📄 License

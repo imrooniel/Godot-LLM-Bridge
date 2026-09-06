@@ -1,3 +1,8 @@
+---
+name: drive
+description: Use when driving a running Godot 4 game in a closed feedback loop — injecting held input, sampling per-frame telemetry, asserting an invariant, then adjusting input and repeating until the invariant holds or a stop condition is met. Trigger keywords: drive loop, held input, game hold, game release, game held-keys, telemetry, game watch, game sample, game get-many, per-frame sample, invariant, close-the-loop, "drive the game", "make the player move".
+---
+
 # Agent Skill: Drive
 
 Drive a **running** Godot 4 game in a **closed feedback loop**: inject held input → sample

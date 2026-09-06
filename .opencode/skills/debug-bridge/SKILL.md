@@ -1,3 +1,8 @@
+---
+name: debug-bridge
+description: Use when interacting with a running Godot 4 game from the terminal — inspecting or controlling live game nodes, reading game logs, driving UI, injecting held input, taking screenshots, or debugging via DAP. Trigger keywords: DebugBridge, editor_bridge_cli.py, game ping, game logs, game inspect-tree, game signal, game key, game hold, game watch, game sample, game get-many, time-scale, screenshot-b64, game game-status, "running game", "game bridge unreachable", DAP debugger attach.
+---
+
 # Agent Skill: DebugBridge
 
 Interact with a **running** Godot 4 game from the terminal. Game operations go through the **unified** `scripts/editor_bridge_cli.py` under the `game` subcommand tree. The editor process proxies each request over TCP to the in-game `DebugBridge` autoload (`127.0.0.1:5555`, falls back +1..+9 if busy).
