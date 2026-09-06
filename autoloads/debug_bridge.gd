@@ -44,6 +44,36 @@ func _ready() -> void:
 	if _debug_verbose:
 		print("[DBridge] Timer started, process_mode=%d" % _poll_timer.process_mode)
 
+## Per-frame telemetry sampler (Phase 2). Runs every frame but only does work
+## when a capture is active and it's the right frame (frame-counter gated, so it
+## is fps-adaptive and drift-free). Sampled into a capped ring buffer; serialized
+## only on telemetry_sample.
+func _process(_delta: float) -> void:
+	if not _telemetry_active or _telemetry_nodes.is_empty():
+		return
+	if _telemetry_frame_step < 1:
+		_telemetry_frame_step = 1
+	if Engine.get_process_frames() % _telemetry_frame_step != 0:
+		return
+	var values: Dictionary = {}
+	for entry in _telemetry_nodes:
+		var node: Node = entry["node"]
+		if not is_instance_valid(node):
+			continue
+		var node_vals: Dictionary = {}
+		for prop in entry["props"]:
+			node_vals[str(prop)] = _read_prop(node, str(prop))
+		values[node.name] = node_vals
+	var sample: Dictionary = {
+		"frame": Engine.get_process_frames(),
+		"ts": Time.get_ticks_msec(),
+		"fps": Engine.get_frames_per_second(),
+		"values": values,
+	}
+	_telemetry_buf.append(sample)
+	if _telemetry_buf.size() > _TELEMETRY_MAX_SAMPLES:
+		_telemetry_buf.pop_front()
+
 func _start_listening() -> void:
 	for attempt in range(MAX_PORT_ATTEMPTS):
 		var try_port: int = DEFAULT_PORT + attempt
@@ -247,6 +277,29 @@ var _debug_verbose: bool = false
 # call to enforce this.
 var _lua_in_flight: bool = false
 
+# --- Held input ---------------------------------------------------------------
+# Viewport.push_input() fires _input/_unhandled_input callbacks but does NOT
+# update the Input singleton's polled key-state (is_key_pressed /
+# is_action_pressed), which is only mutated by the platform DisplayServer's
+# real-input path. So a game that polls input (e.g. Input.get_vector) will NOT
+# see a pushed key. We therefore maintain explicit held-key / held-action sets
+# that game code can poll (is_key_held / is_action_held) IN ADDITION to still
+# pushing the events (so _input-based code also works). See hold_key/release_key.
+var _held_keycodes: Dictionary = {}  # keycode (int) -> true while held
+var _held_actions: Dictionary = {}   # action name (String) -> true while held
+
+# --- Telemetry (per-frame property sampling) ----------------------------------
+# Pull-based: a _process hook samples a ring buffer of node properties gated by
+# the frame counter (Engine.get_process_frames() % _telemetry_frame_step == 0).
+# Node refs are resolved ONCE at telemetry_start (not per tick) to keep the
+# per-frame cost bounded. The buffer stores raw Variant dicts; JSON
+# serialization happens only in telemetry_sample (not on the sampling tick).
+var _telemetry_active: bool = false
+var _telemetry_nodes: Array = []      # [{"node": Node, "props": Array[String]}]
+var _telemetry_frame_step: int = 1
+var _telemetry_buf: Array = []        # capped ring of samples
+var _TELEMETRY_MAX_SAMPLES: int = 600
+
 ## Extract node path from params, accepting both "path" and "node_path" keys.
 func _get_node_path_param(params: Dictionary, default: String = "") -> String:
 	if params.has("path"):
@@ -268,6 +321,13 @@ func _init_handlers() -> void:
 		"screenshot_base64":   _cmd_screenshot_base64,
 		"inject_key":          _cmd_inject_key,
 		"inject_mouse":        _cmd_inject_mouse,
+		"hold_key":            _cmd_hold_key,
+		"release_key":         _cmd_release_key,
+		"held_keys":           _cmd_held_keys,
+		"batch_get":           _cmd_batch_get,
+		"telemetry_start":     _cmd_telemetry_start,
+		"telemetry_stop":      _cmd_telemetry_stop,
+		"telemetry_sample":    _cmd_telemetry_sample,
 		"list_signals":        _cmd_list_signals,
 		"list_methods":        _cmd_list_methods,
 		"find_nodes":          _cmd_find_nodes,
@@ -344,6 +404,60 @@ func _resolve_node(path: String) -> Dictionary:
 		return {"error": "Node not found: " + full_path
 			+ " (from path '%s'; use root-relative paths as returned by scan-ui)" % path}
 	return {"node": node}
+
+## Read a property, supporting dotted sub-properties (e.g. "rotation.y",
+## "transform.origin.x"). Splits on the last '.'; the head must be a real property.
+## Vector/Transform sub-fields are read via DIRECT member access (r.y, t.origin.x) —
+## in Godot 4.8 Vector3/Vector4/Transform have NO .get() method and are not Objects
+## you can dispatch on (Callable(v, "get") is an invalid signature), so method
+## dispatch (container.get(tail) / has_method) must NOT be used.
+func _read_prop(node: Node, prop: String) -> Variant:
+	var parts: PackedStringArray = prop.split(".")
+	if parts.size() == 1:
+		if _has_property(node, prop):
+			return node.get(prop)
+		return null
+	var head: String = parts[0]
+	var tail: String = ".".join(parts.slice(1))
+	if not _has_property(node, head):
+		return null
+	var c: Variant = node.get(head)
+	# One dotted level (rotation.y / rotation.x / ...). typeof() is global — Vector
+	# types are not Nodes and don't have .get_type().
+	if tail.length() == 1:
+		match typeof(c):
+			TYPE_VECTOR3:
+				return _vec3_component(c, tail)
+			TYPE_VECTOR4:
+				return _vec4_component(c, tail)
+			TYPE_VECTOR2:
+				return _vec2_component(c, tail)
+	# Deeper (transform.origin.x) — the intermediate is a Vector.
+	if typeof(c) == TYPE_TRANSFORM3D:
+		var t: Transform3D = c
+		if tail == "origin.x": return t.origin.x
+		if tail == "origin.y": return t.origin.y
+		if tail == "origin.z": return t.origin.z
+	return null
+
+func _vec3_component(v: Vector3, c: String) -> float:
+	match c:
+		"x": return v.x
+		"y": return v.y
+		"z": return v.z
+		_: return 0.0
+func _vec4_component(v: Vector4, c: String) -> float:
+	match c:
+		"x": return v.x
+		"y": return v.y
+		"z": return v.z
+		"w": return v.w
+		_: return 0.0
+func _vec2_component(v: Vector2, c: String) -> float:
+	match c:
+		"x": return v.x
+		"y": return v.y
+		_: return 0.0
 
 func _cmd_ping(_params: Dictionary) -> Dictionary:
 	return {"result": {"pong": true, "port": _bound_port}}
@@ -538,12 +652,19 @@ func _cmd_call_method(params: Dictionary) -> Dictionary:
 func _cmd_screenshot(params: Dictionary) -> Dictionary:
 	var path: String = str(params.get("path", "user://debug_bridge_screenshot.png"))
 	if not path.begins_with("user://"):
-		return _make_error(params.get("__id", null), -32602, "Screenshot path must be in user:// directory")
+		return {"ok": false, "error": "Screenshot path must be in user:// directory"}
+	# get_image() returns the LAST RENDERED frame; settle first so a just-acted-on
+	# scene has actually drawn (Phase 4). Coroutines are supported by _dispatch.
+	var wait_ms: int = int(params.get("wait_ms", 0))
+	if wait_ms > 0:
+		await get_tree().create_timer(wait_ms / 1000.0).timeout
 	var image: Image = get_viewport().get_texture().get_image()
+	if image == null:
+		return {"ok": false, "error": "Viewport has no texture (not rendered yet?)"}
 	var err: Error = image.save_png(path)
 	if err == Error.OK:
-		return {"result": {"ok": true, "path": path}}
-	return _make_error(params.get("__id", null), -32000, "Screenshot failed to save to " + path + ": error %d" % err)
+		return {"ok": true, "path": path, "width": image.get_width(), "height": image.get_height()}
+	return {"ok": false, "error": "Screenshot failed to save to " + path + ": error %d" % err}
 
 func _deserialize_input_event(data: Dictionary) -> InputEvent:
 	"""Construct a Godot InputEvent from JSON data."""
@@ -692,6 +813,166 @@ func _key_string_to_code(key: String) -> int:
 				return c.unicode_at(0)
 			return 0
 
+# --- Held input (Phase 1a) ----------------------------------------------------
+# push_input fires _input/_unhandled_input but does NOT update Input's polled
+# key-state, so a game that polls input (Input.get_vector) won't see pushed
+# keys. hold_key/release_key maintain explicit held-key + held-action sets that
+# game code polls (is_key_held / is_action_held), and ALSO push the events so
+# _input-based code (e.g. mouse look) still works.
+func _push_key_event(keycode: int, pressed: bool) -> void:
+	var event := InputEventKey.new()
+	event.keycode = keycode as Key
+	event.physical_keycode = keycode as Key
+	event.pressed = pressed
+	event.echo = false
+	get_viewport().push_input(event)
+
+## Map a keycode to the InputMap action(s) that use it, so holding W also marks
+## the "move_forward" action as held (the player polls actions, not raw keys).
+## NOTE: we match on the keycode alone (NOT the event's `pressed` flag) — the
+## project's [input] section serializes key events with pressed=false, so a
+## pressed-only filter would match nothing. The keycode is what identifies the key.
+func _actions_for_keycode(keycode: int) -> Array[String]:
+	# Prefer an exact `keycode` match; fall back to a `physical_keycode` match.
+	# (The project's [input] section can serialize a key event with either field
+	# set to the code and the other to 0 — e.g. W is keycode=87 in move_forward but
+	# keycode=KEY_ESCAPE(4194309)/physical=87 in ui_close_dialog.macos — so matching
+	# physical-only would wrongly mark move_forward as held for Esc.)
+	var out: Array[String] = []
+	var physical_out: Array[String] = []
+	for action in InputMap.get_actions():
+		var matched_specific := false
+		for ev in InputMap.action_get_events(action):
+			if ev is InputEventKey:
+				var ke: InputEventKey = ev as InputEventKey
+				if ke.keycode == keycode:
+					matched_specific = true
+					break
+		if matched_specific:
+			out.append(action)
+		elif _action_has_physical(InputMap.action_get_events(action), keycode):
+			physical_out.append(action)
+	for a in physical_out:
+		if not out.has(a):
+			out.append(a)
+	return out
+
+func _action_has_physical(events: Array, keycode: int) -> bool:
+	for ev in events:
+		if ev is InputEventKey and (ev as InputEventKey).physical_keycode == keycode:
+			return true
+	return false
+
+func _cmd_hold_key(params: Dictionary) -> Dictionary:
+	var key_name: String = str(params.get("key", "")).to_upper()
+	var keycode: int = _key_string_to_code(key_name)
+	if keycode == 0:
+		return _make_error(params.get("__id", null), -32602, "Unknown key: " + key_name)
+	_held_keycodes[keycode] = true
+	for action in _actions_for_keycode(keycode):
+		_held_actions[action] = true
+	_push_key_event(keycode, true)
+	return {"result": {"ok": true, "keycode": keycode, "actions": _actions_for_keycode(keycode)}}
+
+func _cmd_release_key(params: Dictionary) -> Dictionary:
+	var key_name: String = str(params.get("key", "")).to_upper()
+	var keycode: int = _key_string_to_code(key_name)
+	if keycode == 0:
+		return _make_error(params.get("__id", null), -32602, "Unknown key: " + key_name)
+	_held_keycodes.erase(keycode)
+	for action in _actions_for_keycode(keycode):
+		_held_actions.erase(action)
+	_push_key_event(keycode, false)
+	return {"result": {"ok": true, "keycode": keycode}}
+
+func _cmd_held_keys(_params: Dictionary) -> Dictionary:
+	return {"result": {"keycodes": _held_keycodes.keys(), "actions": _held_actions.keys()}}
+
+## Polling API for game code (Phase 1a). True if the given key is currently held
+## via hold_key. Does NOT consult the Input singleton (push_input doesn't update
+## it) — only the bridge's own held set.
+func is_key_held(p_keycode: int) -> bool:
+	return _held_keycodes.has(p_keycode)
+
+## Polling API for game code (Phase 1a). True if the given InputMap action has
+## any of its keys currently held via hold_key. This is what a polling controller
+## (Input.get_vector / Input.is_action_pressed) should consult when being driven.
+func is_action_held(p_action: String) -> bool:
+	return _held_actions.has(p_action)
+
+# --- Batch property read (Phase 1b) -------------------------------------------
+# Collapses N (node, prop) reads into ONE round-trip (each get_property is a full
+# editor-mailbox + proxy + game round-trip, each subject to the proxy timeout and
+# single-client serialization). Reuses the same per-item helpers as get_property.
+# A bad item is collected (not a hard error) so one missing node doesn't abort
+# the rest. Synchronous on the main thread — keep item counts bounded.
+func _cmd_batch_get(params: Dictionary) -> Dictionary:
+	var items: Array = params.get("items", [])
+	if items.is_empty():
+		return _make_error(params.get("__id", null), -32602, "batch_get: 'items' is empty")
+	var out: Array = []
+	for item in items:
+		var it: Dictionary = item
+		var path: String = _get_node_path_param(it)
+		var prop: String = str(it.get("prop", ""))
+		var node_result := _resolve_node(path)
+		if "error" in node_result:
+			out.append({"path": path, "prop": prop, "error": node_result["error"]})
+			continue
+		var node: Node = node_result["node"]
+		# _read_prop handles dotted sub-props (rotation.y) too; null means not found.
+		var raw: Variant = _read_prop(node, prop)
+		if raw == null and not _has_property(node, prop) and not _has_property(node, str(prop.split(".")[0])):
+			out.append({"path": path, "prop": prop, "error": "Property not found: " + prop + " on " + node.name})
+			continue
+		var value: Variant = _variant_to_serializable(raw)
+		out.append({"path": path, "prop": prop, "value": value, "type": _variant_type_name(raw)})
+	return {"result": {"items": out}}
+
+# --- Telemetry (Phase 2) ------------------------------------------------------
+func _cmd_telemetry_start(params: Dictionary) -> Dictionary:
+	var hz: float = float(params.get("hz", 30.0))
+	var nodes: Array = params.get("nodes", [])
+	var resolved: Array = []
+	var errors: Array = []
+	for entry in nodes:
+		var e: Dictionary = entry
+		var path: String = _get_node_path_param(e)
+		var node_result := _resolve_node(path)
+		if "error" in node_result:
+			errors.append({"path": path, "error": node_result["error"]})
+			continue
+		resolved.append({"node": node_result["node"], "props": Array(e.get("props", []))})
+	_telemetry_nodes = resolved
+	# Gate by frame counter, fps-adaptive. fps is a coarse rolling value; floor to
+	# >= 1 so we always sample at least every frame (never skip all).
+	var fps: float = Engine.get_frames_per_second()
+	if fps < 1.0:
+		fps = 60.0
+	_telemetry_frame_step = max(1, int(roundf(fps / hz)))
+	_telemetry_buf = []
+	_telemetry_active = true
+	return {"result": {"ok": true, "hz": hz, "frame_step": _telemetry_frame_step,
+					   "fps": Engine.get_frames_per_second(),
+					   "capturing": resolved.size(), "errors": errors}}
+
+func _cmd_telemetry_stop(_params: Dictionary) -> Dictionary:
+	_telemetry_active = false
+	var count: int = _telemetry_buf.size()
+	_telemetry_buf = []
+	_telemetry_nodes = []
+	return {"result": {"ok": true, "samples": count}}
+
+func _cmd_telemetry_sample(params: Dictionary) -> Dictionary:
+	if not _telemetry_active:
+		return _make_error(params.get("__id", null), -32602, "telemetry is not running (call telemetry_start first)")
+	var limit: int = int(params.get("limit", 0))
+	var samples: Array = _telemetry_buf
+	if limit > 0 and samples.size() > limit:
+		samples = samples.slice(samples.size() - limit)
+	return {"result": {"running": true, "count": _telemetry_buf.size(),
+					   "frame_step": _telemetry_frame_step, "samples": samples}}
+
 func _cmd_list_signals(params: Dictionary) -> Dictionary:
 	var path: String = _get_node_path_param(params)
 	var node_result := _resolve_node(path)
@@ -720,16 +1001,22 @@ func _cmd_list_methods(params: Dictionary) -> Dictionary:
 # --- New command handlers (Task 2) ---
 
 func _cmd_screenshot_base64(params: Dictionary) -> Dictionary:
+	# Settle before capture (get_image returns the last rendered frame).
+	var wait_ms: int = int(params.get("wait_ms", 0))
+	if wait_ms > 0:
+		await get_tree().create_timer(wait_ms / 1000.0).timeout
 	var image: Image = get_viewport().get_texture().get_image()
+	if image == null:
+		return {"ok": false, "error": "Viewport has no texture (not rendered yet?)"}
 	var scale: float = clampf(float(params.get("scale", 1.0)), 0.1, 4.0)
 	if scale != 1.0:
 		image.resize(int(image.get_width() * scale),
 					 int(image.get_height() * scale))
 	var bytes: PackedByteArray = image.save_png_to_buffer()
 	var b64: String = Marshalls.raw_to_base64(bytes)
-	return {"result": {"base64_png": b64,
-					   "width": image.get_width(),
-					   "height": image.get_height()}}
+	return {"ok": true, "base64_png": b64,
+			"width": image.get_width(),
+			"height": image.get_height()}
 
 func _cmd_get_scene_info(_params: Dictionary) -> Dictionary:
 	var root := get_tree().current_scene

@@ -68,6 +68,24 @@ python scripts/editor_bridge_cli.py game inspect-tree root --depth 3
 python scripts/editor_bridge_cli.py game get <node_path> <prop>
 python scripts/editor_bridge_cli.py game set <node_path> <prop> <value>
 
+# Held input — drive a controller that polls Input.get_vector / is_action_pressed.
+# (game key only fires _input callbacks and will NOT move a polling controller.)
+python scripts/editor_bridge_cli.py game hold W          # press AND hold (marks move_forward held)
+python scripts/editor_bridge_cli.py game held-keys       # show currently held keys/actions
+python scripts/editor_bridge_cli.py game release W       # ALWAYS release when done
+
+# Per-frame telemetry — observe motion (position/rotation over time), not a snapshot
+python scripts/editor_bridge_cli.py game watch --nodes Main/Player --props '["global_position","rotation.y"]' --hz 30
+python scripts/editor_bridge_cli.py game sample --limit 3
+python scripts/editor_bridge_cli.py game telemetry-stop
+
+# Batch reads — many (node, prop) pairs in one round-trip
+python scripts/editor_bridge_cli.py game get-many Main/Player Main/Player --props global_position rotation.y
+
+# Idempotent read commands (get/get-many/watch/sample/held-keys/screenshot/...) auto-retry
+# up to 3x on a transient bridge drop; mutations (set/hold/release/call) never blind-retry.
+# Pass --no-retry to a read to disable retry.
+
 # DAP Debugger commands
 python scripts/editor_bridge_cli.py debugger state
 python scripts/editor_bridge_cli.py debugger attach

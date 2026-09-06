@@ -606,14 +606,29 @@ GAME_COMMANDS = {
                                                  "recursive": not a.no_recursive,
                                                  "owned": a.owned}),
     "inspect-control": ("inspect_control", lambda a: {"path": a.path}),
-    "screenshot":      ("screenshot", lambda a: {"path": a.path}),
-    "screenshot-b64":  ("screenshot_base64", lambda a: {"scale": a.scale}),
+    "screenshot":      ("screenshot", lambda a: {"path": a.path, "wait_ms": a.wait_ms}),
+    "screenshot-b64":  ("screenshot_base64", lambda a: {"scale": a.scale, "wait_ms": a.wait_ms}),
     "game-status":     ("game_status", lambda a: {}),
     "lua-eval":        ("execute_lua", lambda a: {"code": a.code}),
     "logs":            ("get_godot_logs", lambda a: {"from": a.from_line,
                                                      "max_lines": a.max_lines}),
     "key":             ("inject_key", lambda a: {"key": a.key_name,
                                                  "pressed": not a.release}),
+    # Held input (Phase 1a): hold_key/release_key keep the bridge's held set (which
+    # a polling controller consults) AND push the event. Use these — not `key` —
+    # to drive a game that reads Input.get_vector / is_action_pressed.
+    "hold":            ("hold_key", lambda a: {"key": a.key_name}),
+    "release":         ("release_key", lambda a: {"key": a.key_name}),
+    "held-keys":       ("held_keys", lambda a: {}),
+    # Batch read (Phase 1b): one round-trip for many (node, prop) reads.
+    "get-many":        ("batch_get", lambda a: {
+        "items": [{"path": p, "prop": pr} for p, pr in zip(a.paths, a.props)]}),
+    # Telemetry (Phase 2): per-frame property sampling ring buffer.
+    "watch":           ("telemetry_start", lambda a: {
+        "hz": a.hz,
+        "nodes": [{"path": p, "props": _parse_value(pr)} for p, pr in zip(a.nodes, a.props)]}),
+    "sample":          ("telemetry_sample", lambda a: {"limit": a.limit}),
+    "telemetry-stop":  ("telemetry_stop", lambda a: {}),
     "mouse":           ("inject_mouse", lambda a: {"action": a.action, "x": a.x, "y": a.y,
                                                    "button": a.button,
                                                    "unhandled": a.unhandled}),
@@ -629,6 +644,15 @@ GAME_COMMANDS = {
 # Game requests that can legitimately take longer.
 SLOW_GAME_OP_TIMEOUT = 120.0
 GAME_TIMEOUTS = {"lua-eval": SLOW_GAME_OP_TIMEOUT, "screenshot": 30.0, "screenshot-b64": 30.0}
+
+# Phase 3: game subcommands that are IDEMPOTENT reads and therefore safe to
+# bounded-retry on a transient bridge drop. Mutations (set/call/hold/release/
+# inject_*) are deliberately EXCLUDED — blind-retrying them could double-apply.
+RETRYABLE_GAME_COMMANDS = {
+    "get", "get-many", "held-keys", "inspect-tree", "scan-ui", "find-nodes",
+    "inspect-control", "signals", "methods", "scene-info", "game-status",
+    "sample", "screenshot", "screenshot-b64", "logs", "crashes",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -693,6 +717,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Exact OK button text (e.g. 'Reload from disk')")
 
     g = subparsers.add_parser("game")
+    g.add_argument("--no-retry", action="store_true",
+                   help="Do not retry idempotent read commands on a transient bridge drop")
     g_sub = g.add_subparsers(dest="game_command", required=True)
     g_sub.add_parser("ping")
     gi = g_sub.add_parser("inspect-tree")
@@ -733,8 +759,12 @@ def build_parser() -> argparse.ArgumentParser:
     gic.add_argument("path")
     gss = g_sub.add_parser("screenshot")
     gss.add_argument("path", nargs="?", default="user://debug_bridge_screenshot.png")
+    gss.add_argument("--wait-ms", dest="wait_ms", type=int, default=0,
+                     help="Settle this long before capturing (get_image returns the last rendered frame)")
     gssb64 = g_sub.add_parser("screenshot-b64")
     gssb64.add_argument("--scale", type=float, default=1.0)
+    gssb64.add_argument("--wait-ms", dest="wait_ms", type=int, default=0,
+                        help="Settle this long before capturing (get_image returns the last rendered frame)")
     g_sub.add_parser("game-status")
     glua = g_sub.add_parser("lua-eval")
     glua.add_argument("code")
@@ -744,6 +774,24 @@ def build_parser() -> argparse.ArgumentParser:
     gkey = g_sub.add_parser("key")
     gkey.add_argument("key_name")
     gkey.add_argument("--release", action="store_true")
+    # Held input (Phase 1a) — drive a polling controller (Input.get_vector):
+    ghold = g_sub.add_parser("hold", help="Hold a key (updates the bridge held-set a polling controller reads; also pushes the event)")
+    ghold.add_argument("key_name")
+    grel = g_sub.add_parser("release", help="Release a previously held key")
+    grel.add_argument("key_name")
+    g_sub.add_parser("held-keys", help="List currently held keys/actions")
+    # Batch read (Phase 1b) — one round-trip for many (node, prop) reads:
+    ggetmany = g_sub.add_parser("get-many", help="Read many (node, prop) pairs in one round-trip")
+    ggetmany.add_argument("paths", nargs="+", help="Node path(s)")
+    ggetmany.add_argument("--props", nargs="+", required=True, help="Prop(s), parallel to paths")
+    # Telemetry (Phase 2) — per-frame property sampling ring buffer:
+    gwatch = g_sub.add_parser("watch", help="Start per-frame telemetry sampling of node props")
+    gwatch.add_argument("--nodes", nargs="+", required=True, help="Node path(s)")
+    gwatch.add_argument("--props", nargs="+", required=True, help="Prop(s), parallel to nodes (JSON list, e.g. '[\"x\",\"y\"]')")
+    gwatch.add_argument("--hz", type=float, default=30.0, help="Target sample rate (fps-adaptive)")
+    gsample = g_sub.add_parser("sample", help="Read the telemetry ring buffer")
+    gsample.add_argument("--limit", type=int, default=0, help="Only return the last N samples (0 = all)")
+    g_sub.add_parser("telemetry-stop", help="Stop telemetry sampling and discard the buffer")
     gmouse = g_sub.add_parser("mouse")
     gmouse.add_argument("action", choices=["click", "move"])
     gmouse.add_argument("x", type=int)
@@ -957,15 +1005,26 @@ def main() -> None:
             method, params = GAME_COMMANDS[args.game_command]
             params = params(args)
             timeout = GAME_TIMEOUTS.get(args.game_command, DEFAULT_TIMEOUT)
-            try:
-                result = client.rpc("game." + method, params, timeout=timeout)
-            except EditorBridgeError as e:
-                # The game bridge is unreachable. This commonly means the game
-                # process crashed (or is mid-restart). Surface crash context:
-                # the editor's view of the game + the last crash it captured, so
-                # the user sees WHY instead of a bare "unreachable".
-                _print_game_unreachable(e)
-                sys.exit(1)
+            # Phase 3: bounded read-only retry. The game bridge is single-client and
+            # the editor proxy times out (10 s) / drops mid-restart, so a one-shot
+            # `game get` can spuriously fail. Retry only IDEMPOTENT reads (never
+            # blind-retry a mutation that may already have applied). Bounded so a
+            # genuinely-dead game fails fast instead of hanging.
+            retries = 0 if getattr(args, "no_retry", False) else (3 if args.game_command in RETRYABLE_GAME_COMMANDS else 0)
+            attempt = 0
+            while True:
+                try:
+                    result = client.rpc("game." + method, params, timeout=timeout)
+                    break
+                except EditorBridgeError as e:
+                    attempt += 1
+                    if attempt > retries:
+                        # The game bridge is unreachable. This commonly means the
+                        # game process crashed (or is mid-restart). Surface crash
+                        # context: the editor's view + the last crash captured.
+                        _print_game_unreachable(e)
+                        sys.exit(1)
+                    time.sleep(min(0.5 * attempt, 1.5))  # short backoff before retry
             if args.game_command in ("screenshot",):
                 result["local_path"] = _resolve_user_path(args.path)
             print(json.dumps(result, indent=2))

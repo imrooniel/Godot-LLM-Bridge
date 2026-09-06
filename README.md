@@ -8,6 +8,7 @@
 - **Real DAP Debugging**: Hooks into Godot's built-in Debug Adapter Protocol (port 6006) for breakpoints, stepping, call stacks, and variable evaluation via the CLI.
 - **Two-Process Clarity**: Clear separation between the Editor process (EditorBridge) and the Game process (DebugBridge on 127.0.0.1:5555).
 - **GDScript-First by Default**: The bridge works purely with GDScript and Godot nodes. Lua support via `lua-gdextension` is optional and can be enabled if your project uses Lua.
+- **Closed-Loop Driving**: Drive a running game and observe it over time — held input (`game hold`/`release`, which drives polling controllers that `game key` cannot), per-frame **telemetry** (`game watch`/`sample`) to watch position/rotation/physics change frame-to-frame, **batch reads** (`game get-many`) in one round-trip, and **bounded auto-retry** on idempotent reads.
 - **Heartbeat Liveness**: `.tmp/bridge/state.json` carries a heartbeat (updated every 250 ms). The `ping` command verifies editor and game liveness before actions.
 
 ## 📦 Installation
@@ -45,10 +46,26 @@ python scripts/editor_bridge_cli.py game ping
 python scripts/editor_bridge_cli.py debugger attach
 ```
 
+### Driving a running game (closed loop)
+
+```bash
+# Observe motion over time (per-frame telemetry)
+python scripts/editor_bridge_cli.py game watch --nodes Main/Player --props '["global_position","rotation.y"]' --hz 30
+
+# Drive a polling controller with held input (game key won't move it)
+python scripts/editor_bridge_cli.py game hold W
+python scripts/editor_bridge_cli.py game sample --limit 3   # position should be changing
+python scripts/editor_bridge_cli.py game release W
+
+# Batch reads in one round-trip
+python scripts/editor_bridge_cli.py game get-many Main/Player --props global_position rotation.y
+```
+
 ## 📚 Documentation
 
 - [Human Guide](docs/HUMAN_GUIDE.md) — Installation, usage, and key features for game developers and CI/CD engineers.
-- [Agent Skills](docs/AGENT_SKILLS/) — Documentation for LLMs and AI agents (`editor-bridge.md`, `debug-bridge.md`).
+- [Agent Skills](docs/AGENT_SKILLS/) — Documentation for LLMs and AI agents (`editor-bridge.md`, `debug-bridge.md`, `drive.md`).
+- [Bridge Improvement Plan](docs/bridge-improvement-plan.md) — Design rationale and verification for the closed-loop driving features.
 
 ## 📄 License
 
