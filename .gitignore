@@ -1,6 +1,12 @@
 # Godot import artifacts (regenerated on every filesystem scan)
 *.import
 
+# Godot 4+ generated cache (regenerated per-machine; should not be committed)
+.godot/
+
+# Bridge runtime state (mailbox + logs, regenerated per-session)
+.tmp/
+
 # Python bytecode from the bridge CLI
 __pycache__/
 *.pyc
