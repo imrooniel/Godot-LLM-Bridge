@@ -16,7 +16,7 @@ extends RefCounted
 
 const HOST := "127.0.0.1"
 const PORT := 5555
-const DEFAULT_TIMEOUT_S := 10.0
+const DEFAULT_TIMEOUT_S := 120.0
 const CONNECT_WAIT_MS := 1000
 
 var _peer: StreamPeerTCP = null
@@ -83,16 +83,37 @@ func tick() -> Array:
 
 	for id: String in _pending.keys():
 		var p: Dictionary = _pending[id]
-		var nl: int = p.buffer.find("\n")
-		if nl >= 0:
+		# Consume complete lines; keep the one whose "id" matches our request.
+		# Lines without a matching id (e.g. JSON-RPC notifications/acks, or stray
+		# log notifications pushed by the game) are skipped, not treated as the
+		# response. This lets execute_lua send an early ack and still return the
+		# real result.
+		var matched := false
+		while not matched and p.buffer.length() > 0:
+			var nl: int = p.buffer.find("\n")
+			if nl < 0:
+				break
 			var line: String = p.buffer.substr(0, nl).strip_edges()
+			p.buffer = p.buffer.substr(nl + 1)
+			if line.is_empty():
+				continue
 			var parsed: Variant = JSON.parse_string(line)
-			if parsed is Dictionary:
-				completed.append({"id": id, "response": parsed})
-			else:
+			if not (parsed is Dictionary):
 				completed.append(_fail(id, "game bridge returned invalid JSON"))
-			_pending.erase(id)
-		elif Time.get_ticks_msec() > p.deadline_ms:
+				_pending.erase(id)
+				matched = true
+				break
+			var line_id: Variant = parsed.get("id", null)
+			# Match by id. Our request id is the numeric 1 (see start_request),
+			# but the pending key `id` is a unique String; compare against the
+			# JSON-RPC id we sent (always 1) — so accept any line with an "id".
+			if line_id != null:
+				completed.append({"id": id, "response": parsed})
+				_pending.erase(id)
+				matched = true
+		if matched:
+			continue
+		if Time.get_ticks_msec() > p.deadline_ms:
 			completed.append(_fail(id, "game bridge request timed out after %.0fs" % p.timeout_s))
 			_pending.erase(id)
 			reset()  # a timed-out request desyncs the stream — reconnect
