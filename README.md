@@ -10,62 +10,82 @@
 - **GDScript-First by Default**: The bridge works purely with GDScript and Godot nodes. Lua support via `lua-gdextension` is optional and can be enabled if your project uses Lua.
 - **Closed-Loop Driving**: Drive a running game and observe it over time — held input (`game hold`/`release`, which drives polling controllers that `game key` cannot), per-frame **telemetry** (`game watch`/`sample`) to watch position/rotation/physics change frame-to-frame, **batch reads** (`game get-many`) in one round-trip, and **bounded auto-retry** on idempotent reads.
 - **Heartbeat Liveness**: `.tmp/bridge/state.json` carries a heartbeat (updated every 250 ms). The `ping` command verifies editor and game liveness before actions.
+- **Verified, not asserted**: a first-class **compile gate** (`action scripts-check`) and a richer `godot-status` mean "done" is backed by a readback — a broken script can't be mistaken for a clean one, and a paused game is surfaced with an actionable note. See `bridge/game/GUIDE.md`.
+- **Self-contained & game-agnostic**: everything lives in a single portable `bridge/` folder with no game-specific code — drop it into any Godot 4 project.
 
 ## 📦 Installation
 
-1. **Enable the Editor Plugin**: 
-   - Copy the `addons/editor_bridge/` folder to your Godot project's `addons/` directory.
-   - Open **Project → Project Settings → Plugins** and enable **EditorBridge**.
+The bridge is self-contained in the `bridge/` folder. Copy that folder into your Godot 4 project, then:
 
-2. **Add the Game Autoload**:
-   - Copy `autoloads/debug_bridge.gd` and `autoloads/debug_log_collector.gd` to your project.
-   - Add `DebugBridge="*res://debug_bridge.gd"` to the `[autoload]` section in your `project.godot`.
+1. **Add the game autoload** — in your `project.godot` `[autoload]` section:
 
-3. **Install the CLI**:
-   - The Python CLI script is located in `scripts/editor_bridge_cli.py`. No external Python dependencies are required.
+   ```ini
+   [autoload]
+   DebugBridge="*res://bridge/autoloads/debug_bridge.gd"
+   ```
+
+2. **Enable the two editor plugins** — in `project.godot` `[editor_plugins]`:
+
+   ```ini
+   [editor_plugins]
+   enabled=PackedStringArray("res://bridge/editor_bridge/plugin.cfg", "res://bridge/human_edit/plugin.cfg")
+   ```
+
+   (or enable **Editor Bridge** and **HumanEdit** under **Project → Project Settings → Plugins**).
+
+3. **The CLI** — `bridge/cli/editor_bridge_cli.py` has no external Python dependencies.
+
+Then hook in your own game: see `bridge/game/GUIDE.md` (a minimal worked sample is in `bridge/game/example/`).
 
 ## 🚀 Quick Start
 
 ```bash
 # Launch the editor and wait for the bridge
-python scripts/editor_bridge_cli.py launch
+python bridge/cli/editor_bridge_cli.py launch
 
 # Check liveness
-python scripts/editor_bridge_cli.py ping
+python bridge/cli/editor_bridge_cli.py ping
 
 # Query editor state
-python scripts/editor_bridge_cli.py query state
+python bridge/cli/editor_bridge_cli.py query state
 
 # Play a scene
-python scripts/editor_bridge_cli.py action scene-play --path res://scenes/main.tscn
+python bridge/cli/editor_bridge_cli.py action scene-play --path res://scenes/main.tscn
 
 # Verify game bridge
-python scripts/editor_bridge_cli.py game ping
+python bridge/cli/editor_bridge_cli.py game ping
 
 # Attach DAP debugger
-python scripts/editor_bridge_cli.py debugger attach
+python bridge/cli/editor_bridge_cli.py debugger attach
 ```
 
-### Driving a running game (closed loop)
+### Drive, verify, and gate (closed loop)
 
 ```bash
 # Observe motion over time (per-frame telemetry)
-python scripts/editor_bridge_cli.py game watch --nodes Main/Player --props '["global_position","rotation.y"]' --hz 30
+python bridge/cli/editor_bridge_cli.py game watch --nodes Main/Player --props '["global_position","rotation.y"]' --hz 30
 
 # Drive a polling controller with held input (game key won't move it)
-python scripts/editor_bridge_cli.py game hold W
-python scripts/editor_bridge_cli.py game sample --limit 3   # position should be changing
-python scripts/editor_bridge_cli.py game release W
+python bridge/cli/editor_bridge_cli.py game hold W
+python bridge/cli/editor_bridge_cli.py game sample --limit 3   # position should be changing
+python bridge/cli/editor_bridge_cli.py game release W
 
 # Batch reads in one round-trip
-python scripts/editor_bridge_cli.py game get-many Main/Player --props global_position rotation.y
+python bridge/cli/editor_bridge_cli.py game get-many Main/Player --props global_position rotation.y
+
+# Compile gate: prove a script parses before you trust it
+python bridge/cli/editor_bridge_cli.py action scripts-check res://scripts/my_scene_builder.gd
+
+# Read back the live game state (scenes, port, breakpoints, paused note)
+python bridge/cli/editor_bridge_cli.py game godot-status
 ```
 
 ## 📚 Documentation
 
-- [Human Guide](docs/HUMAN_GUIDE.md) — Installation, usage, and key features for game developers and CI/CD engineers.
-- **Agent Skills** (auto-detected by opencode) — live under `.opencode/skills/`: `editor-bridge/SKILL.md`, `debug-bridge/SKILL.md`, `drive/SKILL.md`. Each is a standard opencode skill (YAML frontmatter + body) so an opencode session in this project picks them up automatically.
-- [Bridge Improvement Plan](docs/bridge-improvement-plan.md) — Design rationale and verification for the closed-loop driving features.
+- `bridge/README.md` — layout, install, and how to hook in your game.
+- [Human Guide](docs/HUMAN_GUIDE.md) — installation, usage, and key features for game developers and CI/CD engineers.
+- **Agent Skills** — live under `bridge/skills/`: `editor-bridge/SKILL.md`, `debug-bridge/SKILL.md`, `drive/SKILL.md`, `human-edit/SKILL.md`.
+- [Bridge Improvement Plan](docs/bridge-improvement-plan.md) — design rationale and verification for the closed-loop driving features.
 
 ## 📄 License
 

@@ -18,7 +18,7 @@ config/features=PackedStringArray("4.8", "Forward Plus")
 
 [autoload]
 
-DebugBridge="*res://autoloads/debug_bridge.gd"
+DebugBridge="*res://bridge/autoloads/debug_bridge.gd"
 
 [display]
 
@@ -28,4 +28,4 @@ window/stretch/mode="canvas_items"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/editor_bridge/plugin.cfg")
+enabled=PackedStringArray("res://bridge/editor_bridge/plugin.cfg", "res://bridge/human_edit/plugin.cfg")

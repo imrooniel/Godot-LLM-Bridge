@@ -10,3 +10,7 @@
 # Python bytecode from the bridge CLI
 __pycache__/
 *.pyc
+
+# Agent skill/tooling config (keep only the human-facing AGENTS.md)
+.opencode/*
+!.opencode/AGENTS.md
