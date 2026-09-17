@@ -824,11 +824,8 @@ def _report_paused_game(client, state: dict) -> None:
           "`debugger step-over`", file=sys.stderr)
     print("  To resume the game:  `debugger continue`   (or `action scene-stop`)",
           file=sys.stderr)
-    if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
+    # (Q1: the file-mailbox client has nothing to close — the old
+    # client.close() call raised AttributeError into a bare pass.)
 
 
 # ---------------------------------------------------------------------------

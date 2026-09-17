@@ -372,9 +372,11 @@ func _proxy_game(id: String, cmd: String, args: Dictionary, timeout: float) -> V
 			note = "Is the game bridge still starting?"
 		else:
 			note = "Is the game running with the DebugBridge autoload?"
+		# T4-m5: report the port we're actually dialing (discovered), not the
+		# constant default — a mismatch is exactly what this error is about.
 		return _error(-32001,
 			"Game bridge unreachable at %s:%d (editor says game running: %s). %s"
-			% [GameProxyScript.HOST, GameProxyScript.PORT, str(playing), note])
+			% [GameProxyScript.HOST, _game_proxy.discovered_port, str(playing), note])
 	return null  # response arrives via _game_proxy.tick()
 
 
@@ -564,6 +566,11 @@ func _diff_state() -> void:
 		_emit_event("game_stopped", {})
 		if _dap:
 			_dap.on_game_stopped()
+		# H1: the discovered port (B3) belonged to the game that just died —
+		# reset it so the next game is dialed at the default port and
+		# re-discovered via its ping.
+		if _game_proxy:
+			_game_proxy.forget_port()
 		changed = true
 	_prev_snapshot = cur
 	if changed:

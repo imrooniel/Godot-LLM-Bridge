@@ -517,7 +517,11 @@ func _on_response(msg: Dictionary) -> void:
 		"attach":
 			if success:
 				attached = true
-				_write_response(id, _ok_body(body))
+				# Q2: guard like every other branch — the internal
+				# attach("", {}) from the boot-break recover must not write a
+				# stray empty-id outbox file.
+				if id != "":
+					_write_response(id, _ok_body(body))
 				var post: Variant = item.get("post", {})
 				if post is Dictionary and not post.is_empty():
 					_queue.append(post)

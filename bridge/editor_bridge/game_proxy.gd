@@ -78,6 +78,15 @@ func note_reported_port(p: int) -> void:
 		reset()  # safe: the triggering ping already left _pending
 
 
+## H1: discovery is per-game — a dead game's reported port is meaningless for
+## the next one. Reset the dial target to the default and drop the (dead)
+## peer so the NEXT game is dialed at PORT and re-discovered via its ping,
+## instead of wedging on a stale 5556 until an editor restart.
+func forget_port() -> void:
+	discovered_port = PORT
+	reset()
+
+
 ## The editor mirrors the DAP session's break state here. While true, WRITE
 ## commands are deferred (see start_request) rather than sent into a frozen game.
 func set_breaked(b: bool) -> void:
@@ -92,14 +101,16 @@ func start_request(id: String, method: String, params: Dictionary, timeout_s: fl
 	# breaked) and wedge the single-client slot. Fail fast with a legible,
 	# structured deferred response instead of touching the peer.
 	if _game_breaked and _WRITE_COMMANDS.has(method):
-		_stale_failures = [{"id": id, "response": {
+		# append (not assign): several deferred writes can land in one poll
+		# tick; assigning would drop every earlier frame's structured refusal.
+		_stale_failures.append({"id": id, "response": {
 			"error": {
 				"code": -32042,
 				"message": "write deferred: game is paused at a breakpoint (DAP breaked=true)",
 				"reason": "game_paused",
 				"suggested": ["debugger continue", "retry this write after the game resumes"],
 			},
-		}}]
+		}})
 		return false
 	if not _pending.is_empty():
 		# A leftover _pending entry means a prior request was never completed
@@ -110,7 +121,7 @@ func start_request(id: String, method: String, params: Dictionary, timeout_s: fl
 		# refuse rather than double-send (id matching would drop the reply).
 		# We surface this via a completed frame the core writes immediately.
 		if _peer == null or not is_reachable():
-			_stale_failures = _fail_stale_pending()
+			_stale_failures.append_array(_fail_stale_pending())
 		else:
 			return false
 	if not _ensure_connected():
