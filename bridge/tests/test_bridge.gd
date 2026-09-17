@@ -99,7 +99,27 @@ func _initialize() -> void:
 	var no_run: Dictionary = bridge._cmd_telemetry_sample({})
 	_check("telemetry: sample while not running -> error", "error" in no_run)
 
+	# B9: the unpausable timer helper returns a valid timer object.
+	var t = bridge._unpausable_timer(0.01)
+	_check("B9: _unpausable_timer returns a SceneTreeTimer", t != null)
+
+	# B7: the per-instance log path is pid-keyed (no longer machine-global).
+	bridge._clear_logs_for_session()
+	_check("B7: _clear_logs_for_session runs", bridge._log_collector != null)
+
 	bridge.queue_free()
+	await process_frame  # let the bridge (and its TCP listener) be freed
+
+	# B4: with no game/bridge listening, is_reachable() must return false cleanly
+	# (it will attempt a connect to 127.0.0.1:5555 and fail). Use the proxy, not
+	# the bridge (the proxy is the editor-side client). This check runs AFTER the
+	# test debug_bridge is freed on purpose: that instance also listens on
+	# 127.0.0.1:5555 (its _ready() opens the server in debug builds) and would
+	# answer the probe, making "no server" false.
+	var proxy = load("res://bridge/editor_bridge/game_proxy.gd").new()
+	await process_frame
+	_check("game_proxy.is_reachable() false with no server", proxy.is_reachable() == false)
+	proxy.reset()
 
 	print("")
 	print("=== Bridge Test Results ===")

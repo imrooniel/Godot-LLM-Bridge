@@ -39,6 +39,8 @@ import sys
 import time
 import uuid
 
+import cli_proc  # local module, same dir
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BRIDGE_DIR = os.path.join(PROJECT_ROOT, ".tmp", "bridge")
 INBOX_DIR = os.path.join(BRIDGE_DIR, "inbox")
@@ -51,6 +53,7 @@ LAUNCH_MARKER_PREFIX = "=== EditorBridge launch"
 DEFAULT_TIMEOUT = 30.0
 LIVE_WINDOW_S = 2.0      # heartbeat younger than this = editor alive
 LAUNCH_DEADLINE_S = 300.0  # first run after an engine upgrade reimports everything
+OUTBOX_PURGE_AGE_S = 120.0  # outbox files older than this are pruned on CLI start
 BINARY_CONFIG = os.path.join(PROJECT_ROOT, ".godot-editor-path")
 
 
@@ -105,6 +108,9 @@ def _find_godot_binary():
     for name in ("godot", "godot4", "Godot", "godot-editor"):
         found = shutil.which(name)
         if found:
+            print("Note: using auto-detected Godot binary '%s'. Pin it by writing the "
+                  "path to %s (or set GODOT_EDITOR_BINARY) to avoid version ambiguity."
+                  % (found, BINARY_CONFIG), file=sys.stderr)
             return found
 
     system = platform.system()
@@ -148,8 +154,14 @@ def _find_godot_binary():
                 for entry in sorted(os.listdir(match), reverse=True):
                     full = os.path.join(match, entry)
                     if os.path.isfile(full) and os.access(full, os.X_OK):
+                        print("Note: using auto-detected Godot binary '%s'. Pin it by writing the "
+                              "path to %s (or set GODOT_EDITOR_BINARY) to avoid version ambiguity."
+                              % (full, BINARY_CONFIG), file=sys.stderr)
                         return full
             elif os.path.isfile(match) and os.access(match, os.X_OK):
+                print("Note: using auto-detected Godot binary '%s'. Pin it by writing the "
+                      "path to %s (or set GODOT_EDITOR_BINARY) to avoid version ambiguity."
+                      % (match, BINARY_CONFIG), file=sys.stderr)
                 return match
     return None
 
@@ -159,6 +171,38 @@ def _atomic_write(path, data: dict) -> None:
     with open(tmp, "w") as f:
         json.dump(data, f)
     os.replace(tmp, path)
+
+
+def _launch_preflight(project_path: str = None) -> None:
+    """Refuse to start a second EDITOR for this project, and surface any
+    orphan GAME from a previous (hard-killed) session.
+
+    Fixes A2 (correct editor-vs-game + path matching) and A4/C1 (orphan game
+    detection). An orphan game is NOT fatal (a new editor can still be
+    started), but we warn loudly because while it holds port 5555 the new
+    game's bridge will bind 5556 and the proxy could talk to the wrong
+    process (see Task 4 port discovery). Override with
+    EDITOR_BRIDGE_ALLOW_MULTI=1.
+    """
+    if os.environ.get("EDITOR_BRIDGE_ALLOW_MULTI") == "1":
+        return
+    proj = project_path or PROJECT_ROOT
+    procs = cli_proc.find_godot_procs(proj)
+    if procs["editors"]:
+        pids = ", ".join(str(p) for p, _ in procs["editors"])
+        print("Error: Godot editor already running on this project (pid(s): %s)." % pids,
+              file=sys.stderr)
+        print("A second editor corrupts the shared bridge mailbox. Quit it first "
+              "(or kill the pid), then retry. Set EDITOR_BRIDGE_ALLOW_MULTI=1 to "
+              "override.", file=sys.stderr)
+        sys.exit(1)
+    if procs["games"]:
+        pids = ", ".join(str(p) for p, _ in procs["games"])
+        print("Warning: an orphan Godot GAME process from a previous session is "
+              "still running (pid(s): %s). It may hold debug-bridge port 5555, "
+              "which can make the new game bind a different port and the bridge "
+              "talk to the wrong process. Kill it (kill %s) or `action scene-stop` "
+              "if its editor is alive." % (pids, pids.split(", ")[0]), file=sys.stderr)
 
 
 def _parse_value(value: str):
@@ -233,6 +277,25 @@ class EditorBridgeClient:
     def __init__(self):
         for d in (BRIDGE_DIR, INBOX_DIR, OUTBOX_DIR, EVENTS_DIR):
             os.makedirs(d, exist_ok=True)
+        self._purge_mailbox()
+
+    def _purge_mailbox(self) -> None:
+        """Bound inbox + outbox (Fix: unbounded mailbox growth; A7: inbox was
+        never pruned by the CLI). Only files older than OUTBOX_PURGE_AGE_S are
+        removed so a concurrent in-flight request is left alone."""
+        now = time.time()
+        for d in (INBOX_DIR, OUTBOX_DIR):
+            try:
+                for name in os.listdir(d):
+                    path = os.path.join(d, name)
+                    try:
+                        if os.path.isfile(path) and \
+                                now - os.path.getmtime(path) > OUTBOX_PURGE_AGE_S:
+                            os.unlink(path)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
 
     # --- liveness ---------------------------------------------------------
 
@@ -325,7 +388,17 @@ class EditorBridgeClient:
         Editor stdout/stderr are captured to .tmp/logs/editor-console.log —
         the ONLY record of pre-plugin-init output (startup parse errors).
         A marker line with the editor pid separates each launch.
+
+        Pre-flight: refuses to start if another Godot editor is already running
+        on this project (the outward half of the launch contract) — see
+        _launch_preflight. This is what stops the multi-instance pile-up.
         """
+        _launch_preflight(project_path)
+        proj = project_path or PROJECT_ROOT
+        path_err = cli_proc.validate_project_path(proj)
+        if path_err:
+            print("Error: %s" % path_err, file=sys.stderr)
+            sys.exit(1)
         binary = _find_godot_binary()
         if not binary:
             print("Error: Godot binary not found.", file=sys.stderr)
@@ -333,14 +406,23 @@ class EditorBridgeClient:
                   " or install Godot 4.x." % BINARY_CONFIG, file=sys.stderr)
             sys.exit(1)
 
-        cmd = [binary, "--editor", "--path", project_path or PROJECT_ROOT]
-        print("Launching: %s --editor --path %s"
-              % (binary, rel(project_path or PROJECT_ROOT)), file=sys.stderr)
-
+        cmd = [binary, "--editor", "--path", proj]
+        print("Launching: %s --editor --path %s" % (binary, rel(proj)), file=sys.stderr)
         log_dir = os.path.dirname(CONSOLE_LOG)
         os.makedirs(log_dir, exist_ok=True)
         log_file = open(CONSOLE_LOG, "ab", buffering=0)
-        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        kwargs = dict(stdout=log_file, stderr=subprocess.STDOUT,
+                      stdin=subprocess.DEVNULL,
+                      close_fds=True)
+        # A1: detach so Ctrl-C / the CLI parent's death won't take the editor
+        # with it. `start_new_session` is a Popen kwarg (setsid on POSIX), NOT a
+        # `subprocess` module attribute — the old `hasattr(subprocess,
+        # "start_new_session")` guard was ALWAYS False, so the detach silently
+        # never applied. On Windows the kwarg raises ValueError, so guard on the
+        # platform (this project is Linux-only in practice).
+        if os.name == "posix":
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **kwargs)
         try:
             log_file.write(("\n%s %s (editor pid %d) ===\n"
                             % (LAUNCH_MARKER_PREFIX, time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -367,7 +449,22 @@ class EditorBridgeClient:
 
         print("Error: editor did not become ready within %.0fs" % LAUNCH_DEADLINE_S,
               file=sys.stderr)
-        print("Tail of editor console:", file=sys.stderr)
+        # A1: a timed-out launch must not leave the spawned editor running.
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+            print("Killed the spawned editor (pid %d) that never became ready."
+                  % proc.pid, file=sys.stderr)
+        except Exception as e:
+            print("Could not kill the spawned editor (pid %d): %s — check for "
+                  "orphan godot processes manually." % (proc.pid, e), file=sys.stderr)
+        # A8: structural diagnosis (why no heartbeat).
+        procs = cli_proc.find_godot_procs(proj)
+        if procs["editors"] or procs["games"]:
+            print("Other godot processes for this project are still present: "
+                  "editors=%s games=%s — an orphan may be holding the project."
+                  % ([p for p, _ in procs["editors"]], [p for p, _ in procs["games"]]),
+                  file=sys.stderr)
         self._print_console_tail(20)
         sys.exit(1)
 
@@ -382,33 +479,64 @@ class EditorBridgeClient:
     # --- restart ----------------------------------------------------------
 
     def restart(self, project_path=None) -> dict:
-        """CLI-owned editor restart: quit, wait for death, launch.
+        """CLI-owned editor restart: (1) stop any running game, (2) ask the
+        editor to quit, (3) wait until the editor PID is gone, (4) launch.
 
         Never trust the engine's own restart (EditorInterface.restart_editor
         = save + quit, and the relaunch is a best-effort spawn whose failure
         is silently dropped — main.cpp:5327 ignores create_instance's Error):
         the editor can stay dead with no trace. Here the CLI remains the one
         thing that ever starts the editor (the launch contract).
+
+        Fixes C2/A6 (a running/paused game triggers the engine's 'Stop & Quit'
+        modal — stop the game FIRST so the quit is clean and the engine kills
+        the game child) and C3 (wait on the editor's PID = process liveness,
+        not the state.json heartbeat age, which is stale while a modal blocks
+        the main loop).
         """
         state = self.read_state()
         if state and state.get("alive"):
-            print("Asking the editor to quit...", file=sys.stderr)
+            # 1) Stop a running game first (modal-free quit). If breaked, the
+            #    game main thread is frozen but stop_playing_scene() kills the
+            #    child process from the editor side, so it works (C5).
+            game = state.get("game", {}) or {}
+            if game.get("running"):
+                print("Stopping the running game before quit...", file=sys.stderr)
+                try:
+                    self.rpc("action.scene.stop", {}, timeout=30)
+                except (EditorBridgeError, EditorBridgeNotRunning) as e:
+                    print("scene-stop not acknowledged (%s) — continuing" % e,
+                          file=sys.stderr)
+                # give the diff a moment to observe game_stopped
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    st = self.read_state()
+                    if not st or not (st.get("game", {}) or {}).get("running"):
+                        break
+                    time.sleep(0.25)
+            # 2) Ask the editor to quit.
+            editor_pid = int((state.get("editor", {}) or {}).get("pid", 0))
+            print("Asking the editor (pid %d) to quit..." % editor_pid, file=sys.stderr)
             try:
                 self.rpc("action.editor.close", {}, timeout=10)
             except (EditorBridgeError, EditorBridgeNotRunning) as e:
                 print("close request not acknowledged (%s) — waiting anyway" % e,
                       file=sys.stderr)
-            deadline = time.time() + 30.0
+            # 3) Wait on the editor PID (process liveness), not heartbeat age.
+            deadline = time.time() + 45.0
             while time.time() < deadline:
-                st = self.read_state()
-                if not st or not st.get("alive"):
+                if editor_pid and not cli_proc.pid_alive(editor_pid):
                     break
+                st = self.read_state()
+                if st is None:  # state.json deleted on clean _exit_tree
+                    if not editor_pid or not cli_proc.pid_alive(editor_pid):
+                        break
                 time.sleep(0.25)
             else:
-                print("Error: editor still alive 30s after the quit request — a "
-                      "modal dialog (unsaved scene / running project) is likely "
+                print("Error: editor (pid %d) still alive 45s after the quit request — "
+                      "a modal dialog (unsaved scene / running project) is likely "
                       "blocking shutdown. Inspect with `query dialogs` and "
-                      "`action dialog-accept`, then retry.", file=sys.stderr)
+                      "`action dialog-accept`, then retry." % editor_pid, file=sys.stderr)
                 sys.exit(1)
             print("Editor stopped.", file=sys.stderr)
         else:
@@ -548,6 +676,7 @@ _TRANSPORT_MARKERS = (
     "unreachable",                     # editor-side: bridge not reachable (start failed)
     "timed out",                       # editor-side timeout AND in-game proxy timeout
     "disconnected mid-request",        # in-game proxy: socket dropped while pending
+    "previous request lost",           # in-game proxy: stale-peer recovery (was mislabeled as logic_error, B2)
 )
 
 
@@ -1016,6 +1145,8 @@ def build_parser() -> argparse.ArgumentParser:
     dubp = d_sub.add_parser("unbreak", help="Remove a breakpoint (auto-attaches)")
     dubp.add_argument("file")
     dubp.add_argument("line", type=int)
+    d_sub.add_parser("clear-breakpoints",
+                     help="Clear ALL editor-side breakpoints (stop games booting breaked)")
     d_sub.add_parser("breaks", help="List known breakpoints")
     d_sub.add_parser("continue", help="Resume execution")
     d_sub.add_parser("pause", help="Pause the running game")
@@ -1238,6 +1369,15 @@ def main() -> None:
                 except EditorBridgeError as e:
                     out["game_bridge"] = False
                     out["game_bridge_note"] = str(e)
+                    # B5: a paused game (breaked) makes the 5555 bridge silent —
+                    # surface the same inline DAP investigation any other failed
+                    # game command gets, instead of a bare note. Gate on a
+                    # TRANSPORT failure too, so a structured logic error does not
+                    # trigger the investigation just because the game is breaked.
+                    st = client.read_state() or {}
+                    if _is_game_transport_failure(e) \
+                            and (st.get("debugger", {}) or {}).get("breaked"):
+                        _print_game_unreachable(e)
                 print(json.dumps(_contract_ok(out, _current_state(state)), indent=2))
                 return
             if args.game_command == "rpc":
@@ -1248,10 +1388,26 @@ def main() -> None:
                 # animation) can exceed the 30 s default; give rpc the slow-op budget
                 # (same as lua-eval) so a slow-but-valid op isn't killed early.
                 rpc_timeout = SLOW_GAME_OP_TIMEOUT
-                try:
-                    result = client.rpc("game." + method, params, timeout=rpc_timeout)
-                except EditorBridgeError as e:
-                    _handle_game_error(e)
+                # B6: idempotency-gated retry for read-only registered methods.
+                # Writes (start_scene, combat_*, set_*) are NOT retried (double-apply risk).
+                read_only_rpc = method in {"combat_snapshot", "query_game_state", "scene_ready",
+                                           "game_status", "ping"}
+                # honor --no-retry (the GAME_COMMANDS path does), otherwise this
+                # retry path ignores the flag.
+                retries = 0 if getattr(args, "no_retry", False) else (3 if read_only_rpc else 0)
+                attempt = 0
+                while True:
+                    try:
+                        result = client.rpc("game." + method, params, timeout=rpc_timeout)
+                        break
+                    except EditorBridgeError as e:
+                        if _is_game_transport_failure(e) and attempt < retries:
+                            attempt += 1
+                            print("  [retry] rpc %s (transport, attempt %d/%d) — %s"
+                                  % (method, attempt, retries, e), file=sys.stderr)
+                            time.sleep(min(0.5 * attempt, 1.5))
+                            continue
+                        _handle_game_error(e)
                 print(json.dumps(result, indent=2))
                 return
             method, params = GAME_COMMANDS[args.game_command]
@@ -1304,6 +1460,7 @@ def main() -> None:
                 "launch": "action.debugger.launch",
                 "break": "action.debugger.break",
                 "unbreak": "action.debugger.unbreak",
+                "clear-breakpoints": "action.debugger.clear_breakpoints",
                 "breaks": "query.debugger.breaks",
                 "continue": "action.debugger.continue",
                 "pause": "action.debugger.pause",
