@@ -2,7 +2,7 @@ extends Node
 # DebugBridge — standalone TCP socket bridge for AI-driven UI interaction.
 #
 # Install: add to [autoload] in project.godot:
-#   DebugBridge="*res://debug_bridge.gd"
+#   DebugBridge="*res://bridge/autoloads/debug_bridge.gd"
 #
 # Only active in debug builds. Zero overhead in exports.
 
@@ -26,6 +26,14 @@ var _client_connect_time_ms: int = 0
 var _inflight_since_ms := 0  # ticks_ms when the current request started; 0 = none in flight
 var _poll_timer: Timer
 var _lua_vm: Node = null
+
+## B9 (corrected): a timer immune to Engine.time_scale. Scene-pause is already
+## covered (process_always defaults to true); ignore_time_scale=true is the real
+## change — a `game time-scale 0.5` (or 0) slowdown must not stretch/hang a
+## bridge wait. create_timer(time_sec, process_always, process_in_physics,
+## ignore_time_scale).
+func _unpausable_timer(seconds: float) -> SceneTreeTimer:
+	return get_tree().create_timer(seconds, true, false, true)
 
 func _ready() -> void:
 	if not OS.is_debug_build():
@@ -382,11 +390,14 @@ func _init_log_collector() -> void:
 ## This prevents log pollution from previous sessions.
 func _clear_logs_for_session() -> void:
 	_log_collector.clear_messages()
-	var log_file: String = "/tmp/godot_output.log"
+	# B7: per-instance log path (was a machine-global /tmp/godot_output.log that
+	# every godot process clobbered). Keyed by pid so concurrent games don't
+	# truncate each other's file.
+	var log_file: String = "/tmp/godot_output_%d.log" % OS.get_process_id()
 	var file := FileAccess.open(log_file, FileAccess.WRITE)
 	if file != null:
 		file.close()
-	print("[DebugBridge] Log collector cleared for new session")
+	print("[DebugBridge] Log collector cleared for new session (%s)" % log_file)
 
 ## Allow external autoloads (e.g., GameBridge) to register custom JSON-RPC handlers.
 func register_handler(method_name: String, handler: Callable) -> void:
@@ -841,7 +852,7 @@ func _cmd_screenshot(params: Dictionary) -> Dictionary:
 	# supported by _dispatch (same pattern as change_scene / start_scene).
 	var wait_ms: int = int(params.get("wait_ms", 0))
 	if wait_ms > 0:
-		await get_tree().create_timer(wait_ms / 1000.0).timeout
+		await _unpausable_timer(wait_ms / 1000.0).timeout
 	var image: Image = get_viewport().get_texture().get_image()
 	var err: Error = image.save_png(path)
 	if err == Error.OK:
@@ -1191,7 +1202,7 @@ func _cmd_list_methods(params: Dictionary) -> Dictionary:
 func _cmd_screenshot_base64(params: Dictionary) -> Dictionary:
 	var wait_ms: int = int(params.get("wait_ms", 0))
 	if wait_ms > 0:
-		await get_tree().create_timer(wait_ms / 1000.0).timeout
+		await _unpausable_timer(wait_ms / 1000.0).timeout
 	var image: Image = get_viewport().get_texture().get_image()
 	var scale: float = clampf(float(params.get("scale", 1.0)), 0.1, 4.0)
 	if scale != 1.0:
@@ -1348,7 +1359,7 @@ func _wait_scene_change_ready(timeout_ms: int = 8000, poll_ms: int = 50) -> Dict
 	# until the deferred swap lands or the timeout elapses, then break + return
 	# a single value (the analyzer rejects `while true` + early `return`).
 	while waited_ms < timeout_ms:
-		await tree.create_timer(poll_ms / 1000.0).timeout
+		await _unpausable_timer(poll_ms / 1000.0).timeout
 		waited_ms = Time.get_ticks_msec() - start_ms
 		var root := tree.current_scene
 		# The swap has landed once current_scene becomes a DIFFERENT scene than
@@ -1357,7 +1368,7 @@ func _wait_scene_change_ready(timeout_ms: int = 8000, poll_ms: int = 50) -> Dict
 			scene_name = root.name
 			# One extra poll to confirm stability (current_scene not about to be
 			# swapped out again by a pending deferred change).
-			await tree.create_timer(poll_ms / 1000.0).timeout
+			await _unpausable_timer(poll_ms / 1000.0).timeout
 			if tree.current_scene == root:
 				return {"ready": true, "scene": scene_name, "waited_ms": waited_ms}
 	if scene_name.is_empty() and tree.current_scene != null:
@@ -1392,7 +1403,7 @@ func _cmd_start_scene(params: Dictionary) -> Dictionary:
 	var ready: bool = false
 	var poll_s: float = maxf(float(poll_ms) / 1000.0, 0.016)
 	while true:
-		await get_tree().create_timer(poll_s).timeout
+		await _unpausable_timer(poll_s).timeout
 		last_probe = await _eval_probe(probe)
 		ready = (last_probe == true)
 		waited_ms = Time.get_ticks_msec() - start_ms

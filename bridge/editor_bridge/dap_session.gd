@@ -42,6 +42,7 @@ var attached: bool = false   # DAP session bound to an active game session
 var breaked: bool = false    # game paused (stopped seen, no continued yet)
 var _want_attached: bool = false
 var _game_active: bool = false
+var _pending_clear: Dictionary = {}  # {files: Array, id: String, tries: int}
 
 ## Most recent `stopped` event detail (reason/text), so the CLI can surface the
 ## pause reason in state.json without a separate RPC. Cleared on continued /
@@ -210,6 +211,42 @@ func set_breakpoints(mailbox_id: String, file: String, lines: Array) -> bool:
 	return true
 
 
+## Clear the editor's breakpoints for `files` by sending an EMPTY setBreakpoints
+## per file. Works with NO running game: it forces a plain connect (setBreakpoints
+## is not attach-gated — debug_adapter_parser.cpp:352-389 — and a connected peer
+## is enough; poll() sets it as current_peer). The clears are sent once the peer
+## is connectable; the caller (the clear-breakpoints command) is answered via
+## outbox[id] with a summary, or an explicit error if the DAP never connects.
+func clear_editor_breakpoints(files: Array, id: String) -> void:
+	_want_attached = true   # permit a connect even with no game active
+	wake()                  # force the connect attempt on the next tick
+	_pending_clear = {"files": files, "id": id, "tries": 0}
+
+
+## Called from tick(): once the peer is connectable, queue an empty
+## setBreakpoints per file (empty mailbox id — none of them answer the CLI;
+## this method writes the summary), then answer outbox[id]. Bounded so an
+## unreachable DAP server cannot loop forever.
+func _process_pending_clear() -> void:
+	if _pending_clear.is_empty():
+		return
+	if _connectable():
+		var files: Array = _pending_clear.files
+		var id: String = str(_pending_clear.id)
+		for f in files:
+			set_breakpoints("", str(f), [])  # empty id: no per-file outbox write
+		_pending_clear = {}
+		_write_response(id, {"ok": true, "cleared": files.size(), "files": files})
+		return
+	_pending_clear.tries = int(_pending_clear.tries) + 1
+	var tries: int = int(_pending_clear.tries)
+	if tries >= 10:  # ~500 ms at the ~50 ms poll rate
+		var id: String = str(_pending_clear.id)
+		_pending_clear = {}
+		_write_response(id, {"ok": false, "error": {"code": -32000,
+			"message": "DAP did not connect within ~%d ms — editor breakpoints were NOT cleared." % (tries * 50)}})
+
+
 func _queue_config_done() -> void:
 	if _config_done_queued:
 		return
@@ -272,6 +309,15 @@ func _connect_failed(reason: String) -> void:
 	peer = StreamPeerTCP.new()
 	_tx_pending = PackedByteArray()
 	_tx_item = {}
+	# B1: if we were breaked but just lost the DAP observer, clear the stale
+	# breaked state so the game proxy stops deferring ALL writes forever. The
+	# game may still be paused, but we can no longer observe/resume it — the
+	# honest state is "not breaked (we're disconnected)", and a fresh attach on
+	# reconnect will re-observe the real state.
+	if breaked:
+		breaked = false
+		last_stopped = {}
+		breaked_changed.emit(false)
 	_reconnect_at_ms = Time.get_ticks_msec() + 2000  # backoff
 	_emit("debugger_dap", {"state": "disconnected", "reason": reason})
 
@@ -281,6 +327,7 @@ func _connect_failed(reason: String) -> void:
 # ---------------------------------------------------------------------------
 
 func tick() -> void:
+	_process_pending_clear()
 	match phase:
 		Phase.DISCONNECTED:
 			# Idle until a game session is active or an attach was requested —
@@ -451,18 +498,19 @@ func _on_response(msg: Dictionary) -> void:
 	var seq: int = int(msg.get("request_seq", -1))
 	if not _pending.has(seq):
 		return  # stale/duplicate
+	# B10: only treat this as the in-flight response if the in-flight seq matches.
+	# (Previously we erased the pending entry first, so an out-of-order response
+	# erased the right pending then bailed without writing the outbox -> that
+	# request timed out.)
+	var in_flight_seq: int = int(_in_flight.get("seq", -1))
+	if not _in_flight.is_empty() and in_flight_seq != seq:
+		return  # out-of-order; leave the pending entry for the matching response
 	var id: String = str(_pending.get(seq, ""))
 	_pending.erase(seq)
-	# Defensive: an empty _in_flight (bookkeeping out of sync) must never wedge
-	# the pump — only a genuinely different in-flight seq is out-of-order.
-	if _in_flight.is_empty() or int(_in_flight.get("seq", -1)) == seq:
-		_in_flight = {}
-	else:
-		return  # out-of-order (should not happen: serial queue)
-
+	_in_flight = {}
 	var success: bool = bool(msg.get("success", false))
 	var body: Variant = msg.get("body", {})
-	var item: Dictionary = _last_item  # the request this response belongs to
+	var item: Dictionary = _last_item
 	var command: String = str(item.get("command", ""))
 
 	match command:

@@ -41,11 +41,17 @@ var _next_rpc_id: int = 1
 ## must write out on its next tick — start_request is void-ish (bool) so it
 ## can't return them directly (dogfood BD-012).
 var _stale_failures: Array = []
+var discovered_port: int = PORT  # updated from a game `ping` response (B3/C1)
 
 
 func is_reachable() -> bool:
+	# Accurate probe (B4): if there is no live peer and nothing is in flight,
+	# try to (re)connect so the reported state reflects whether the bridge is
+	# actually reachable, not just whether we happen to hold a peer.
 	if _peer == null:
-		return false
+		if not _pending.is_empty():
+			return false  # a request is in flight on a (just-reset) peer; don't race it
+		return _ensure_connected()
 	_peer.poll()
 	return _peer.get_status() == StreamPeerTCP.STATUS_CONNECTED
 
@@ -55,6 +61,21 @@ func reset() -> void:
 		_peer.disconnect_from_host()
 	_peer = null
 	_rx = ""
+
+
+## B3/C1: the in-game bridge reports its ACTUAL bound port in the `ping`
+## response (debug_bridge.gd `_cmd_ping` returns `_bound_port`, the real
+## listening port from the 5555->5564 bind loop). If it differs from the port
+## we're dialing, re-target so we talk to the right game process.
+## CAVEAT (review): ping-driven discovery can only learn a port once it is
+## TALKING to that game — if an orphan already answers on 5555, the proxy talks
+## to the orphan (which reports 5555) and never sees the real game on 5556. The
+## OPERATIVE C1 protection is the scene-play orphan guard (Step 3) + the CLI
+## pre-flight warning (Task 1); this re-target is a correctness safety net.
+func note_reported_port(p: int) -> void:
+	if p > 0 and p != discovered_port:
+		discovered_port = p
+		reset()  # safe: the triggering ping already left _pending
 
 
 ## The editor mirrors the DAP session's break state here. While true, WRITE
@@ -93,7 +114,12 @@ func start_request(id: String, method: String, params: Dictionary, timeout_s: fl
 		else:
 			return false
 	if not _ensure_connected():
-		return false
+		# B8: the game may not have detected the old (half-open) client yet, so
+		# the first reconnect can fail even though the bridge is alive. Retry
+		# once after a short beat (loopback RST is usually immediate).
+		OS.delay_msec(150)
+		if not _ensure_connected():
+			return false
 	var rpc_id := _next_rpc_id
 	_next_rpc_id += 1
 	var req: Dictionary = {"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params}
@@ -198,11 +224,14 @@ func _fail_stale_pending() -> Array:
 
 
 func _ensure_connected() -> bool:
-	if is_reachable():
+	if _peer != null and is_reachable():
 		return true
 	reset()
 	_peer = StreamPeerTCP.new()
-	var err: Error = _peer.connect_to_host(HOST, PORT)
+	# Dial the DISCOVERED port (B3/C1): a game can bind 5556-5564 when 5555 is
+	# held by an orphan; note_reported_port() re-targets this when a ping
+	# response carries the game's real bound port.
+	var err: Error = _peer.connect_to_host(HOST, discovered_port)
 	var waited_ms := 0
 	while err == Error.OK and _peer.get_status() == StreamPeerTCP.STATUS_CONNECTING and waited_ms < CONNECT_WAIT_MS:
 		_peer.poll()
