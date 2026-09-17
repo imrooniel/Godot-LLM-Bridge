@@ -143,7 +143,7 @@ python3 bridge/cli/editor_bridge_cli.py game key ENTER --release
 python3 bridge/cli/editor_bridge_cli.py game mouse click 400 300 [--button 1]
 python3 bridge/cli/editor_bridge_cli.py game mouse move 400 300
 python3 bridge/cli/editor_bridge_cli.py game click-node <node_path>
-python3 bridge/cli/editor_bridge_cli.py game time-scale 0.5          # never 0.0 (crashes)
+python3 bridge/cli/editor_bridge_cli.py game time-scale 0.5          # never 0.0 (freezes the game and stalls the debug bridge)
 python3 bridge/cli/editor_bridge_cli.py game quit
 
 > **Note on Lua support:** Lua-specific commands (`lua-eval`, `lua-eval-act`, `call LuaVM ...`) require the `lua-gdextension` plugin to be enabled in your project. If the Lua extension is not present or not enabled, these commands will not be available. The bridge works purely with GDScript and Godot nodes by default.
@@ -192,6 +192,7 @@ python3 bridge/cli/editor_bridge_cli.py debugger launch --scene res://scenes/com
 python3 bridge/cli/editor_bridge_cli.py debugger break  res://scripts/foo.gd 42
 python3 bridge/cli/editor_bridge_cli.py debugger unbreak res://scripts/foo.gd 42
 python3 bridge/cli/editor_bridge_cli.py debugger breaks
+python3 bridge/cli/editor_bridge_cli.py debugger clear-breakpoints   # remove ALL editor breakpoints (leftover ones pause spawned games at boot)
 python3 bridge/cli/editor_bridge_cli.py debugger pause               # stop a running game
 python3 bridge/cli/editor_bridge_cli.py debugger continue
 python3 bridge/cli/editor_bridge_cli.py debugger step-over           # (requires paused)
@@ -204,6 +205,12 @@ python3 bridge/cli/editor_bridge_cli.py debugger output --max-lines 50
 ```
 
 **How it works:** one persistent DAP client (a core `DapSession` node) owns the TCP connection to the engine's `network/debug_adapter` (port 6006). Commands queue onto it; the matching DAP response is written back to the mailbox. The session idles with a `threads` keepalive every ~4 s (the engine's server rejects any request >5 s after the last client data).
+
+**Self-healing (2026-09-16):** leftover editor breakpoints ride along to every
+spawned game (`--breakpoints`) and pause it at boot — use `debugger
+clear-breakpoints` before `scene-play` (or rely on the auto boot-break
+recover); `launch`/`restart` are process-hygienic (path validation, kill on
+timeout, second-editor refusal, orphan-game warning).
 
 **Gotchas (engine-verified):**
 - Exactly ONE DAP client. A *new* client's `initialize` clears ALL editor breakpoints unless `network/debug_adapter/sync_breakpoints=true` (the core sets it at startup).

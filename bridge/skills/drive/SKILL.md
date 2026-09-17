@@ -119,6 +119,6 @@ held** before finishing.
 - **Holding a key and never releasing it** → the controller stays stuck. Always `game release`.
 - **Asserting on a single `game get`** → that's a snapshot, not motion. Use `watch` + `sample`.
 - **Letting the telemetry buffer overflow** → it caps at ~600 samples and rolls; sample in time.
-- **`time-scale 0.0`** → crashes the game (use `0.5` minimum).
+- **`time-scale 0.0`** → freezes the game and stalls the debug bridge (doesn't crash, but the bridge goes unresponsive) — use `0.5` minimum.
 - **Trusting the first sample after a mutation** → the response can be one step behind; re-read
   `held-keys` / `sample` to confirm the mutation actually applied.

@@ -145,7 +145,7 @@ python3 bridge/cli/editor_bridge_cli.py game call <node_path> <method> [args...]
 ```bash
 python3 bridge/cli/editor_bridge_cli.py game screenshot user://my_screen.png
 python3 bridge/cli/editor_bridge_cli.py game screenshot-b64 --scale 0.5
-python3 bridge/cli/editor_bridge_cli.py game time-scale 0.5   # NEVER 0.0 — it crashes the game
+python3 bridge/cli/editor_bridge_cli.py game time-scale 0.5   # NEVER 0.0 — it freezes the game and stalls the debug bridge
 ```
 
 **Game logs (in-memory collector; cleared each game run):**
@@ -220,7 +220,7 @@ Using `debugger launch --scene <scene>` when the game is already running via `ac
 - **Orphaned game process** → a leftover game process crashes a new editor on launch. `action scene-stop` (or kill the game) before restarting the editor.
 - **Wrong `game` subcommand spelling** → they are **hyphenated**: `lua-eval`, `scan-ui`, `find-nodes`, `click-node`, `time-scale`, `screenshot-b64`, `clear-logs`, `game-status`, `inspect-tree`, `inspect-control`. The CLI rejects the underscore forms.
 - **Compound bash commands** → prefer one command per tool call where possible.
-- **`time-scale 0.0`** → crashes the game.
+- **`time-scale 0.0`** → freezes the game and stalls the debug bridge (doesn't crash, but the bridge goes unresponsive). Use ≥ 0.1.
 - **Key press without `--release`** → leaves the key held.
 - **`click-node`/`mouse`** → coordinate-dependent; prefer `signal … pressed`.
 - **Unquoted `@` paths / hardcoded `@Button@N`** → auto-generated node ids change every run. Always `scan-ui`/`find-nodes` first, then match by text.
