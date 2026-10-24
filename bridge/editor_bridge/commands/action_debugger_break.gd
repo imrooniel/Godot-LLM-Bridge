@@ -8,9 +8,10 @@ extends RefCounted
 ## for the file with (existing lines + this line).
 
 func execute(args: Dictionary, ctx) -> Variant:
-	var dap = ctx.dap
-	if dap == null:
-		return ctx.make_error(-32603, "DAP session not initialized (4.8+ engine required)")
+	var dap_or_err: Variant = ctx.require_dap()
+	if dap_or_err is Dictionary:
+		return dap_or_err
+	var dap = dap_or_err
 	var file: String = str(args.get("file", ""))
 	var line: int = int(args.get("line", 0))
 	if file.is_empty() or line <= 0:

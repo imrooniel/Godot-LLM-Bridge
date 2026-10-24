@@ -2,7 +2,7 @@ extends Node
 # DebugBridge — standalone TCP socket bridge for AI-driven UI interaction.
 #
 # Install: add to [autoload] in project.godot:
-#   DebugBridge="*res://debug_bridge.gd"
+#   DebugBridge="*res://bridge/autoloads/debug_bridge.gd"
 #
 # Only active in debug builds. Zero overhead in exports.
 
@@ -26,6 +26,14 @@ var _client_connect_time_ms: int = 0
 var _inflight_since_ms := 0  # ticks_ms when the current request started; 0 = none in flight
 var _poll_timer: Timer
 var _lua_vm: Node = null
+
+## B9 (corrected): a timer immune to Engine.time_scale. Scene-pause is already
+## covered (process_always defaults to true); ignore_time_scale=true is the real
+## change — a `game time-scale 0.5` (or 0) slowdown must not stretch/hang a
+## bridge wait. create_timer(time_sec, process_always, process_in_physics,
+## ignore_time_scale).
+func _unpausable_timer(seconds: float) -> SceneTreeTimer:
+	return get_tree().create_timer(seconds, true, false, true)
 
 func _ready() -> void:
 	if not OS.is_debug_build():
@@ -361,6 +369,8 @@ func _init_handlers() -> void:
 		"inject_input_event":  _cmd_inject_input_event,
 		"graceful_quit":       _cmd_graceful_quit,
 		"game_status":         _cmd_game_status,
+		"mods_loaded":         _cmd_mods_loaded,
+		"lua_api":             _cmd_lua_api,
 		"execute_lua":         _cmd_execute_lua,
 		"gd_eval":             _cmd_gd_eval,
 		"eval":                _cmd_gd_eval,  # friendly alias; Lua keeps lua-eval/execute_lua
@@ -382,11 +392,14 @@ func _init_log_collector() -> void:
 ## This prevents log pollution from previous sessions.
 func _clear_logs_for_session() -> void:
 	_log_collector.clear_messages()
-	var log_file: String = "/tmp/godot_output.log"
+	# B7: per-instance log path (was a machine-global /tmp/godot_output.log that
+	# every godot process clobbered). Keyed by pid so concurrent games don't
+	# truncate each other's file.
+	var log_file: String = "/tmp/godot_output_%d.log" % OS.get_process_id()
 	var file := FileAccess.open(log_file, FileAccess.WRITE)
 	if file != null:
 		file.close()
-	print("[DebugBridge] Log collector cleared for new session")
+	print("[DebugBridge] Log collector cleared for new session (%s)" % log_file)
 
 ## Allow external autoloads (e.g., GameBridge) to register custom JSON-RPC handlers.
 func register_handler(method_name: String, handler: Callable) -> void:
@@ -841,7 +854,7 @@ func _cmd_screenshot(params: Dictionary) -> Dictionary:
 	# supported by _dispatch (same pattern as change_scene / start_scene).
 	var wait_ms: int = int(params.get("wait_ms", 0))
 	if wait_ms > 0:
-		await get_tree().create_timer(wait_ms / 1000.0).timeout
+		await _unpausable_timer(wait_ms / 1000.0).timeout
 	var image: Image = get_viewport().get_texture().get_image()
 	var err: Error = image.save_png(path)
 	if err == Error.OK:
@@ -1191,7 +1204,7 @@ func _cmd_list_methods(params: Dictionary) -> Dictionary:
 func _cmd_screenshot_base64(params: Dictionary) -> Dictionary:
 	var wait_ms: int = int(params.get("wait_ms", 0))
 	if wait_ms > 0:
-		await get_tree().create_timer(wait_ms / 1000.0).timeout
+		await _unpausable_timer(wait_ms / 1000.0).timeout
 	var image: Image = get_viewport().get_texture().get_image()
 	var scale: float = clampf(float(params.get("scale", 1.0)), 0.1, 4.0)
 	if scale != 1.0:
@@ -1348,7 +1361,7 @@ func _wait_scene_change_ready(timeout_ms: int = 8000, poll_ms: int = 50) -> Dict
 	# until the deferred swap lands or the timeout elapses, then break + return
 	# a single value (the analyzer rejects `while true` + early `return`).
 	while waited_ms < timeout_ms:
-		await tree.create_timer(poll_ms / 1000.0).timeout
+		await _unpausable_timer(poll_ms / 1000.0).timeout
 		waited_ms = Time.get_ticks_msec() - start_ms
 		var root := tree.current_scene
 		# The swap has landed once current_scene becomes a DIFFERENT scene than
@@ -1357,7 +1370,7 @@ func _wait_scene_change_ready(timeout_ms: int = 8000, poll_ms: int = 50) -> Dict
 			scene_name = root.name
 			# One extra poll to confirm stability (current_scene not about to be
 			# swapped out again by a pending deferred change).
-			await tree.create_timer(poll_ms / 1000.0).timeout
+			await _unpausable_timer(poll_ms / 1000.0).timeout
 			if tree.current_scene == root:
 				return {"ready": true, "scene": scene_name, "waited_ms": waited_ms}
 	if scene_name.is_empty() and tree.current_scene != null:
@@ -1392,7 +1405,7 @@ func _cmd_start_scene(params: Dictionary) -> Dictionary:
 	var ready: bool = false
 	var poll_s: float = maxf(float(poll_ms) / 1000.0, 0.016)
 	while true:
-		await get_tree().create_timer(poll_s).timeout
+		await _unpausable_timer(poll_s).timeout
 		last_probe = await _eval_probe(probe)
 		ready = (last_probe == true)
 		waited_ms = Time.get_ticks_msec() - start_ms
@@ -1442,7 +1455,6 @@ func _eval_probe(probe: Dictionary) -> bool:
 			return false
 		return node.get(prop) == probe.get("equals")
 	return true
-
 func _cmd_find_nodes(params: Dictionary) -> Dictionary:
 	var root_path: String = str(params.get("root", "root"))
 	var name_pattern: String = str(params.get("name_pattern", "*"))
@@ -1553,6 +1565,34 @@ func _cmd_game_status(_params: Dictionary) -> Dictionary:
 		"in_combat": in_combat,
 	}}
 
+## S10 pre-flight: list the mod ids loaded in the game. ModLoader is an
+## autoload (project.godot), so it resolves at /root/ModLoader in the game
+## process. loaded_mods holds ModInfo objects (a ModDiscovery inner class),
+## NOT dicts — read mod_id via Object.get(), with a dict fallback so the
+## handler stays correct if the element type ever changes.
+func _cmd_mods_loaded(_params: Dictionary) -> Dictionary:
+	var mod_loader: Node = get_node_or_null("/root/ModLoader")
+	if mod_loader == null:
+		return {"result": {"ok": true, "mods": [], "note": "ModLoader not present"}}
+	var ids: Array = []
+	for mod in mod_loader.loaded_mods:
+		if mod is Dictionary and "mod_id" in mod:
+			ids.append(str(mod["mod_id"]))
+		elif mod is Object:
+			ids.append(str(mod.get("mod_id")))
+	return {"result": {"ok": true, "mods": ids}}
+
+## S7 introspection: list the registered Lua bridge function names — the live
+## entries of LuaVM.bridge_registry (the set reexpose() would write into a
+## fresh state after a vm_reset). LuaVM is an autoload, so it resolves at
+## /root/LuaVM in the game process.
+func _cmd_lua_api(_params: Dictionary) -> Dictionary:
+	var names: Array = []
+	var lua_vm: Node = get_node_or_null("/root/LuaVM")
+	if lua_vm != null and "bridge_registry" in lua_vm:
+		names = lua_vm.bridge_registry.live_names()
+	return {"result": {"ok": true, "functions": names}}
+
 # --- execute_lua (main-thread) --------------------------------------------
 ## Handler entry point (kept in _init_handlers). Runs the Lua INLINE on the
 ## MAIN thread. This is correct: combat actions (targeting, highlights,
@@ -1606,7 +1646,8 @@ func _run_lua_wrapped(lua_vm: Node, code: String) -> Dictionary:
 	wrapped = wrapped + "local function _run() "
 	wrapped = wrapped + code
 	wrapped = wrapped + " end "
-	wrapped = wrapped + "local ok, val = pcall(_run) "
+	wrapped = wrapped + "local function _tb(e) return debug.traceback(tostring(e), 2) end "
+	wrapped = wrapped + "local ok, val = xpcall(_run, _tb) "
 	wrapped = wrapped + "local err = '' if not ok then err = tostring(val) end "
 	wrapped = wrapped + "print = _orig_print "
 	wrapped = wrapped + "return { value = ok and val or nil, stdout = table.concat(_cap, '\\n'), error = err }"
@@ -1650,23 +1691,31 @@ func _cmd_get_godot_logs(params: Dictionary) -> Dictionary:
 
 	var from_index: int = int(params.get("from", 0))
 	var max_lines: int = int(params.get("max_lines", 5000))
+	var tail: int = int(params.get("tail", 0))
 
 	var messages: Array[String] = _log_collector.get_messages()
 	var total: int = messages.size()
 
-	# Clamp from_index to valid range
-	if from_index < 0:
-		from_index = 0
-	if from_index > total:
-		from_index = total
+	# --tail N: last N lines of the buffer (wins over --from when > 0) —
+	# the common "what just happened" read.
+	var start_index: int = 0
+	if tail > 0:
+		start_index = maxi(total - tail, 0)
+	else:
+		# Clamp from_index to valid range
+		if from_index < 0:
+			from_index = 0
+		if from_index > total:
+			from_index = total
+		start_index = from_index
 
-	var end: int = min(from_index + max_lines, total)
-	var slice: Array[String] = messages.slice(from_index, end)
+	var end: int = min(start_index + max_lines, total)
+	var slice: Array[String] = messages.slice(start_index, end)
 
 	return {"result": {
 		"messages": slice,
 		"total_lines": total,
-		"from": from_index,
+		"from": start_index,
 		"count": slice.size(),
 	}}
 

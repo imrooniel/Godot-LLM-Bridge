@@ -63,9 +63,11 @@ var _dap: DapSessionScript = null
 var _subscribers: Dictionary = {}  # client_id -> {"events": Array[String], "state": bool}
 var _prev_snapshot: Dictionary = {}
 var _last_heartbeat_ms := 0
+var _multi_instance_halted := false
 var _last_cleanup_ms := 0
 var _state_dirty := true
 var _tick := 0
+var _deferred: Array = []  # {ticks_left: int, fn: Callable} — polled in _poll()
 
 # Output panel (EditorLog node, name "Output") — lazy discovery.
 var _output_panel: Node = null
@@ -135,6 +137,8 @@ func _enter_tree() -> void:
 	_poll_timer.wait_time = POLL_INTERVAL_S
 	_poll_timer.timeout.connect(_poll)
 	add_child(_poll_timer)
+	if _multi_instance_halted:
+		return  # a second editor owns the mailbox; do not start the poll loop
 	_poll_timer.start()
 
 	print("[EditorBridge] Mailbox bridge ready (v%s) — %s" % [VERSION, BRIDGE_DIR])
@@ -152,7 +156,9 @@ func _exit_tree() -> void:
 		_game_proxy.reset()
 		_game_proxy = null
 	if _dap:
-		_dap.free()
+		# DapSession is a RefCounted (DapSessionScript extends RefCounted) —
+		# null the reference to release it; Object.free() on a RefCounted
+		# throws "Can't free a RefCounted object" and crashes the editor on exit.
 		_dap = null
 	var tree := get_tree()
 	if tree and tree.node_added.is_connected(_on_root_node_added):
@@ -188,6 +194,7 @@ func _poll() -> void:
 	if now - _last_cleanup_ms >= CLEANUP_INTERVAL_MS:
 		_cleanup()
 		_last_cleanup_ms = now
+	_tick_deferred()
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +251,10 @@ func _run_command(id: String, cmd: String, args: Dictionary) -> Variant:
 		return _error(-32601, "Unknown command: %s (no %s)" % [cmd, path])
 	var script: GDScript = ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE)
 	if script == null or not script.can_instantiate():
-		return _error(-32603, "Command script failed to load or compile: %s (check logs)" % cmd)
+		var detail := _script_parse_error(path)
+		var msg := "Command script failed to load or compile: %s" % cmd
+		msg += " — %s" % detail if detail != "" else " (check logs)"
+		return _error(-32603, msg)
 	var handler: RefCounted = script.new()
 	_ctx.current_request_id = id  # for async responses (e.g. DAP requests)
 	var result: Variant = handler.execute(args, _ctx)
@@ -300,6 +310,20 @@ func _recent_failed_check_url() -> String:
 			var rest := line.substr(idx + marker.length())
 			var dot := rest.find(".")
 			return rest.substr(0, dot) if dot != -1 else ""
+	return ""
+
+
+func _script_parse_error(script_path: String) -> String:
+	# Reuse the log collector (the same source _recent_failed_check_url reads).
+	# Return the last error/parse line mentioning the script (or a temp gdscript).
+	if _log_collector == null:
+		return ""
+	var messages := _log_collector.get_messages()
+	var base := script_path.get_file()
+	for i in range(messages.size() - 1, -1, -1):
+		var l := str(messages[i])
+		if ("ERROR" in l or "Parse Error" in l) and (base in l or "gdscript" in l):
+			return l.strip_edges()
 	return ""
 
 
@@ -365,9 +389,11 @@ func _proxy_game(id: String, cmd: String, args: Dictionary, timeout: float) -> V
 			note = "Is the game bridge still starting?"
 		else:
 			note = "Is the game running with the DebugBridge autoload?"
+		# T4-m5: report the port we're actually dialing (discovered), not the
+		# constant default — a mismatch is exactly what this error is about.
 		return _error(-32001,
 			"Game bridge unreachable at %s:%d (editor says game running: %s). %s"
-			% [GameProxyScript.HOST, GameProxyScript.PORT, str(playing), note])
+			% [GameProxyScript.HOST, _game_proxy.discovered_port, str(playing), note])
 	return null  # response arrives via _game_proxy.tick()
 
 
@@ -384,9 +410,25 @@ func _write_game_completion(done: Dictionary) -> void:
 				out.merge(result)
 			else:
 				out["value"] = result
+			# B3/C1: learn the game's real bound port from a ping response.
+			if method_was_ping(done):
+				var port: int = int(out.get("port", 0))
+				if port > 0:
+					_game_proxy.note_reported_port(port)
 			_write_response(id, out)
 	else:
 		_write_response(id, _error(-32001, str(done.get("error", "game bridge error"))))
+
+
+## True if this completion is a `ping` response. The in-game bridge (see
+## _cmd_ping in debug_bridge.gd) returns {"result": {"pong": true, "port": N}};
+## the proxy wraps it in the JSON-RPC envelope, so `done` is
+## {"id": ..., "response": {"jsonrpc": ..., "id": ..., "result": {...}}}.
+func method_was_ping(done: Dictionary) -> bool:
+	var resp: Variant = done.get("response", {})
+	if resp is Dictionary and (resp.get("result", {}) is Dictionary):
+		return bool((resp.get("result", {}) as Dictionary).get("pong", false))
+	return false
 
 
 # ---------------------------------------------------------------------------
@@ -476,8 +518,10 @@ func _update_state() -> void:
 		"game": {
 			"running": playing,
 			"playing_scene": ei.get_playing_scene() if ei else "",
-			"bridge_port": GameProxyScript.PORT if playing else 0,
-			"bridge_connected": _game_proxy.is_reachable() if _game_proxy else false,
+			# gate on `playing` too — `discovered_port` defaults to PORT (5555),
+			# so without the gate it reports 5555 with no game running.
+			"bridge_port": _game_proxy.discovered_port if (playing and _game_proxy) else 0,
+			"bridge_connected": _game_proxy.is_reachable() if (_game_proxy and playing) else false,
 		},
 		"debugger": _dap.get_state() if _dap else {"connected": false},
 		"subscribers": _subscribers.size(),
@@ -533,11 +577,17 @@ func _diff_state() -> void:
 		_emit_event("game_started", {"scene": cur.playing_scene})
 		if _dap:
 			_dap.on_game_started()
+			_schedule_boot_break_recover()
 		changed = true
 	elif not cur.playing and _prev_snapshot.playing:
 		_emit_event("game_stopped", {})
 		if _dap:
 			_dap.on_game_stopped()
+		# H1: the discovered port (B3) belonged to the game that just died —
+		# reset it so the next game is dialed at the default port and
+		# re-discovered via its ping.
+		if _game_proxy:
+			_game_proxy.forget_port()
 		changed = true
 	_prev_snapshot = cur
 	if changed:
@@ -549,6 +599,41 @@ func _write_heartbeat() -> void:
 	var payload: Dictionary = _ctx.state.duplicate(true)
 	payload["alive"] = true
 	payload["heartbeat_ms"] = int(Time.get_unix_time_from_system() * 1000.0)
+	# Ownership check: state.json is a shared, single-writer file. If a FRESH
+	# heartbeat is already present from a DIFFERENT editor pid, a second
+	# instance is racing us on the same mailbox — the exact multi-instance
+	# pile-up that corrupts bridge state. C6: the later instance halts (stops
+	# writing + stops the poll loop) so the two editors never race anymore.
+	var existing: Dictionary = {}
+	var existing_pid: int = -1
+	var existing_age_ms: int = -1
+	if FileAccess.file_exists(STATE_PATH):
+		var f := FileAccess.open(STATE_PATH, FileAccess.READ)
+		if f:
+			var parsed: Variant = JSON.parse_string(f.get_as_text())
+			f.close()
+			if parsed is Dictionary:
+				existing = parsed
+				existing_pid = int(existing.get("editor", {}).get("pid", -1)) \
+						if existing.get("editor", {}) is Dictionary else -1
+	var now_ms := int(Time.get_unix_time_from_system() * 1000.0)
+	existing_age_ms = now_ms - int(existing.get("heartbeat_ms", 0))
+	if existing_pid != -1 and existing_pid != OS.get_process_id() \
+			and existing.get("alive") and existing_age_ms < 2000:
+		# C6: a second editor on the same mailbox corrupts state (shared
+		# inbox/outbox, no pid scoping). The LATER instance must NOT keep racing —
+		# halt the poll loop and warn loudly so the user quits one of the two. We
+		# do NOT auto-quit (that would kill the user's session); we just stop
+		# participating. The `return` skips the _atomic_write below so this
+		# instance never overwrites the other editor's state.json.
+		if not _multi_instance_halted:
+			_multi_instance_halted = true
+			if _poll_timer:  # null-guard (first call predates the timer)
+				_poll_timer.stop()
+		push_error("[EditorBridge] ANOTHER Godot editor (pid %d) owns the bridge mailbox (%s). "
+				+ "This instance has STOPPED participating to avoid corruption. "
+				+ "Quit one of the two editors." % [existing_pid, STATE_PATH])
+		return
 	_atomic_write(STATE_PATH, JSON.stringify(payload, "", false))
 
 
@@ -767,3 +852,45 @@ func _on_dap_state_changed() -> void:
 func _on_dap_breaked_changed(b: bool) -> void:
 	if _game_proxy:
 		_game_proxy.set_breaked(b)
+
+
+## C8: a fresh game can boot ALREADY breaked (the engine passes editor
+## breakpoints via --breakpoints). If so and we're not attached, auto-attach +
+## continue so the game never starts frozen from the LLM's perspective. We wait
+## a couple of poll ticks for the DAP client to connect (game_started ->
+## DISC->CONN race, see C7) before acting.
+func _schedule_boot_break_recover() -> void:
+	_await_ticks(4, func() -> void:
+		if _dap == null:
+			return
+		if not _ctx.state.get("game", {}).get("running", false):
+			return
+		if _dap.breaked and not _dap.attached:
+			_emit_event("boot_break_recover", {"note": "game booted breaked; auto attach+continue"})
+			_dap.attach("", {})  # internal id: response not needed by a CLI caller
+			_await_ticks(4, func() -> void:
+				if _dap and _dap.breaked and _dap.attached:
+					_dap.enqueue("", "continue", {})
+			)
+	)
+
+
+## Tiny tick-awaiter (reuses the existing poll timer; no new timer). Appends
+## `fn` to run after `n` poll ticks. Used by the C8 boot-break auto-recover.
+func _await_ticks(n: int, fn: Callable) -> void:
+	_deferred.append({"ticks_left": n, "fn": fn})
+
+
+## Driven from the tail of _poll(): count each deferred callback down by one
+## tick and fire the ones that reach zero.
+func _tick_deferred() -> void:
+	if _deferred.is_empty():
+		return
+	var still: Array = []
+	for d in _deferred:
+		d.ticks_left -= 1
+		if d.ticks_left <= 0:
+			d.fn.call()
+		else:
+			still.append(d)
+	_deferred = still
