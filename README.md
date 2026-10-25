@@ -4,7 +4,8 @@
 your Godot editor. A file-mailbox bridge between the Godot editor / running
 game and external CLI tools (LLM agents, CI scripts), for programmatic editor
 control, game-state inspection, UI interaction, and real DAP debugging —
-purely GDScript + stdlib Python, no addons, no sockets, no half-open state.
+purely GDScript + stdlib Python; the editor↔CLI path is a file mailbox, so
+there are no half-open sockets to go stale.
 
 Works purely with GDScript and Godot nodes; Lua support via
 `lua-gdextension` is optional (the bridge stays agnostic — projects register
@@ -14,8 +15,8 @@ their own RPC handlers).
 
 | | |
 |---|---|
-| **Godot** | **4.7+** for the core bridge (CI-tested on 4.7.2). `debugger …` commands need **4.8+** — the engine's built-in Debug Adapter Protocol server is 4.8+ only; on 4.7 those commands fail with a clear error, everything else works. |
-| **OS** | Windows 10/11 and Linux (both CI-covered). macOS is not tested and out of scope for support; community patches welcome. |
+| **Godot** | **4.7+** for the core bridge (CI-tested on 4.7.2). `debugger …` commands need **4.8+** — the engine's built-in Debug Adapter Protocol server is 4.8+ only; on 4.7 they answer a clear "DAP not connected" error (or `connected: false`), everything else works. |
+| **OS** | Windows 10/11 and Linux (CLI test suite CI-covered on both; the editor-runtime integration job is Linux-only today). macOS is not tested and out of scope for support; community patches welcome. |
 | **Python** | 3.11+ (CLI is stdlib-only — zero pip installs). |
 
 > As of Oct 2026 the newest **official stable** Godot is 4.7.2; 4.8 lives in
@@ -63,7 +64,7 @@ Ready-made agent skills ship in `bridge/skills/`: `editor-bridge`,
 your project:
 
 ```bash
-cp -r bridge/skills/* .opencode/skills/          # Linux/macOS
+mkdir -p .opencode/skills && cp -r bridge/skills/* .opencode/skills/
 ```
 
 ```powershell
@@ -97,9 +98,10 @@ python3 bridge/cli/editor_bridge_cli.py game logs --from 0
 python3 bridge/cli/editor_bridge_cli.py doctor
 ```
 
-Every command prints JSON; failures exit nonzero with a structured
-`{code, message, reason, suggested}` envelope — the `suggested` field tells
-you the next command to run.
+Every command prints JSON and exits nonzero on failure. Game-command
+failures carry a structured `{code, message, reason, suggested}` envelope;
+editor-side failures print the reason plus `suggested:` follow-up lines —
+either way, `suggested` tells you the next command to run.
 
 ## Daily driving
 
@@ -110,12 +112,12 @@ python3 bridge/cli/editor_bridge_cli.py action scripts-check res://scripts/playe
 # One-shot property read
 python3 bridge/cli/editor_bridge_cli.py game get Main/Player global_position
 
-# Batch reads, one round trip
-python3 bridge/cli/editor_bridge_cli.py game get-many Main/Player --props global_position rotation.y
+# Batch reads, one round trip (--props pairs 1:1 with the node paths)
+python3 bridge/cli/editor_bridge_cli.py game get-many Main/Player Main/Enemy --props global_position rotation.y
 
 # Held input drives polling controllers (a `game key` tap won't)
 python3 bridge/cli/editor_bridge_cli.py game hold W
-python3 bridge/cli/editor_bridge_cli.py game watch --nodes Main/Player --props '["global_position"]' --hz 30   # per-frame samples; Ctrl-C ends the watch
+python3 bridge/cli/editor_bridge_cli.py game watch --nodes Main/Player --props '["global_position"]' --hz 30   # starts the per-frame sampler
 python3 bridge/cli/editor_bridge_cli.py game sample --limit 3    # last 3 samples — position should be changing
 python3 bridge/cli/editor_bridge_cli.py game release W
 python3 bridge/cli/editor_bridge_cli.py game telemetry-stop
@@ -136,8 +138,8 @@ failure. Paste its output when asking for help.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `editor bridge not reachable` | No editor launched through this CLI. Run `launch`. |
-| `game …` commands time out | Game not running (`action scene-play …`) or the `DebugBridge` autoload is missing from your `project.godot`. |
+| `editor not reachable (no fresh heartbeat)` | No editor launched through this CLI, or it died. Run `launch` (or `recover` once). |
+| `game …` commands refuse or time out | Game not running (`action scene-play …`), or the `DebugBridge` autoload is missing from your `project.godot` (then the connect is refused outright). |
 | Editor starts but game never boots | A leftover breakpoint pauses the game at start: `debugger clear-breakpoints`, then `recover`. |
 | `debugger …` says DAP not available | You're on Godot < 4.8 — expected; the DAP server is engine-side. |
 | Two editors fighting over the mailbox | One editor per project directory — the CLI refuses to launch a second; close the other editor. |
