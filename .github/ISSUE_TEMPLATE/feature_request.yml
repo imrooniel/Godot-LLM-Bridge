@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose something new or better
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The workflow that hurts today, and how you work around it.
+      placeholder: As a game developer using the bridge, I can't ... so every session I have to ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Concrete CLI surface (command, flags, JSON output shape) if you have one in mind.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - EditorBridge (editor side)
+        - DebugBridge (game side)
+        - Skills / docs
+        - Tooling (tests, CI, install)
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Willing to contribute
+      options:
+        - label: I'd submit a PR for this (design review first via this issue is recommended)
+          required: false

@@ -1,0 +1,143 @@
+# CI for Godot-LLM-Bridge — the install-path proof for every PR.
+#
+# GODOT_VERSION policy: pin an OFFICIAL stable release (reproducible,
+# checksummed). Currently 4.7.2-stable — the core bridge and all GD tests
+# pass there (verified 2026-10-25). DAP commands (`debugger ...`) need a
+# 4.8+ engine and are exercised in dev, not CI. Bump this pin when a new
+# stable drops; do not chase dev builds.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.7.2"
+  # sha256 of Godot_v<ver>-stable_linux.x86_64.zip from the official release
+  GODOT_SHA256_LINUX_ZIP: "cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4"
+
+jobs:
+  cli:
+    name: CLI tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: CLI test suite (stdlib unittest)
+        run: python bridge/tests/test_cli.py
+      - name: Version consistency (VERSION == plugin.cfg == docs)
+        run: python scripts/check_version.py
+
+  gd-headless:
+    name: GDScript tests (Godot ${{ env.GODOT_VERSION }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download pinned Godot (checksum-verified)
+        run: |
+          set -euo pipefail
+          URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          curl -fsSL -o godot.zip "$URL"
+          echo "${GODOT_SHA256_LINUX_ZIP}  godot.zip" | sha256sum -c -
+          unzip -q godot.zip
+          chmod +x "Godot_v${GODOT_VERSION}-stable_linux.x86_64"
+          echo "GODOT=$PWD/Godot_v${GODOT_VERSION}-stable_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Run GD test suite (each test quits 0/1)
+        run: |
+          set -uo pipefail
+          fails=0
+          for t in bridge_contract_test human_edit_test script_run_test \
+                   scripts_check_test test_bridge_context test_bridge; do
+            echo "--- GD test: $t ---"
+            if "$GODOT" --headless --path . --script "res://bridge/tests/$t.gd"; then
+              echo "GD $t: PASS"
+            else
+              echo "::error::GD $t: FAIL"
+              fails=$((fails + 1))
+            fi
+          done
+          echo "GD failures: $fails"
+          exit "$fails"
+
+  integration:
+    name: End-to-end bridge (real editor + game, xvfb)
+    runs-on: ubuntu-latest
+    needs: [cli, gd-headless]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download pinned Godot (checksum-verified)
+        run: |
+          set -euo pipefail
+          URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          curl -fsSL -o godot.zip "$URL"
+          echo "${GODOT_SHA256_LINUX_ZIP}  godot.zip" | sha256sum -c -
+          unzip -q godot.zip
+          chmod +x "Godot_v${GODOT_VERSION}-stable_linux.x86_64"
+          echo "GODOT_EDITOR_BINARY=$PWD/Godot_v${GODOT_VERSION}-stable_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Install xvfb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+      - name: Drive the bridge end-to-end
+        run: |
+          set -uo pipefail
+          CLI="python bridge/cli/editor_bridge_cli.py"
+          dump_diagnostics() {
+            echo "::group::diagnostics"
+            echo "--- .tmp/logs/ ---"; tail -n 200 .tmp/logs/* 2>/dev/null || echo "(no logs)"
+            echo "--- state.json ---"; cat .tmp/bridge/state.json 2>/dev/null || echo "(no state)"
+            $CLI logs get --max-lines 200 || true
+            echo "::endgroup::"
+          }
+          step() {
+            local name="$1"; shift
+            echo "::group::$name"
+            if ! "$@"; then
+              echo "::error::STEP FAILED: $name"
+              dump_diagnostics
+              exit 1
+            fi
+            echo "::endgroup::"
+          }
+          step "launch editor"    $CLI launch --force
+          step "ping (heartbeat)" $CLI ping
+          step "fs-scan"          $CLI action fs-scan --wait
+          step "scene-play demo"  $CLI action scene-play --path res://scenes/main.tscn
+          # game bridge needs a moment to come up with the game process
+          for i in $(seq 1 30); do
+            if $CLI game ping >/dev/null 2>&1; then echo "game ping: ok (try $i)"; break; fi
+            [ "$i" = 30 ] && { echo "::error::game bridge never came up"; dump_diagnostics; exit 1; }
+            sleep 1
+          done
+          step "game scene-info" $CLI game scene-info
+          step "scene-stop"      $CLI action scene-stop
+          step "editor healthy after stop" $CLI ping
+          echo "INTEGRATION OK"
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-diagnostics
+          path: .tmp/
+          if-no-files-found: ignore
+          retention-days: 5
