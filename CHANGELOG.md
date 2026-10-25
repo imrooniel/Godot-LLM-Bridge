@@ -12,6 +12,12 @@ verify both `bridge/*/plugin.cfg` files match it.
 
 ### Added — community infrastructure
 
+- Launch version gate: `launch` (and therefore `restart`/`recover`) probes
+  `<binary> --version --headless` and refuses engines below the supported
+  floor (4.7 today) with `Error [godot_version]` + install/repin suggestions
+  — no more silent misbehavior on 3.x/old engines; unparseable version
+  output refuses too. Probe uses an injectable runner seam (unit-testable,
+  no process spawns).
 - `doctor` command: static setup diagnosis (project file, Godot feature
   floor 4.7+/4.8-for-DAP, Python floor, Godot binary discovery, autoload +
   plugin registration, editor heartbeat, OS support) with an actionable

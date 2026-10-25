@@ -214,6 +214,7 @@ _REASON_CLASS = {
     "not_broken": "dap_not_breaked",
     "method_not_found": "bad_request",
     "policy_rejected": "policy_rejected",
+    "godot_version": "godot_version",
 }
 _CODE_CLASS = {
     -32603: "load_failed",
@@ -441,3 +442,84 @@ def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
         add("os_support", "ok", "%s is supported" % os_name)
 
     return checks
+
+
+# ---------------------------------------------------------------------------
+# launch version gate — refuse engines below the supported floor
+# ---------------------------------------------------------------------------
+
+# Floor mirrors doctor (core CI-gated on 4.7; DAP needs 4.8 — raise this to
+# (4, 8) when 4.8-stable ships, same commit as the CI pin bump).
+LAUNCH_MIN_GODOT = (4, 7)
+
+
+def parse_godot_version(text):
+    """'4.8.stable.official.x' / '4.7.2...' / '4.8.dev.custom' -> (4, 8)/(4, 7).
+
+    Returns None for None/empty/garbage.
+    """
+    if not text:
+        return None
+    m = re.search(r"(\d+)\.(\d+)", str(text))
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def godot_version_supported(version, minimum=LAUNCH_MIN_GODOT):
+    """True iff version tuple >= minimum. None (unparseable) is unsupported."""
+    return version is not None and version >= tuple(minimum)
+
+
+def version_probe_text(binary, runner=None):
+    """Run `<binary> --version --headless` and return raw output text.
+
+    `runner(cmd_list) -> str` is injectable (tests never spawn processes;
+    Task 16 reuses this seam). Returns None on any failure (missing binary,
+    timeout, spawn error).
+    """
+    cmd = [binary, "--version", "--headless"]
+    if runner is None:
+        runner = _version_runner_subprocess
+    try:
+        return runner(cmd)
+    except Exception:
+        return None
+
+
+def _version_runner_subprocess(cmd):
+    out = subprocess.run(list(cmd), capture_output=True, text=True,
+                         timeout=20)
+    return (out.stdout or "") + (out.stderr or "")
+
+
+def probe_godot_version(binary, runner=None):
+    """Version tuple of `binary`, or None."""
+    return parse_godot_version(version_probe_text(binary, runner=runner))
+
+
+def launch_version_gate(version_text, minimum=LAUNCH_MIN_GODOT):
+    """None if launch may proceed; else an EditorBridgeError payload dict
+    {message, reason, suggested} for the CLI to raise."""
+    v = parse_godot_version(version_text)
+    if godot_version_supported(v, minimum):
+        return None
+    if v is None:
+        snippet = str(version_text or "").strip().replace("\n", " ")[:60]
+        message = ("cannot determine the Godot version of this binary "
+                   "(answered: %r) — this bridge requires Godot >= %d.%d"
+                   % (snippet, minimum[0], minimum[1]))
+    else:
+        message = ("Godot %d.%d is not supported by this bridge — it "
+                   "requires Godot >= %d.%d"
+                   % (v[0], v[1], minimum[0], minimum[1]))
+    return {
+        "message": message,
+        "reason": "godot_version",
+        "suggested": [
+            "install Godot >= %d.%d from https://godotengine.org"
+            % (minimum[0], minimum[1]),
+            "or point the CLI at a supported binary via GODOT_EDITOR_BINARY "
+            "or a .godot-editor-path file (see CONTRIBUTING dev setup)",
+        ],
+    }

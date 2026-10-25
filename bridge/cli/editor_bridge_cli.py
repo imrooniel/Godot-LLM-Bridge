@@ -52,6 +52,10 @@ LAUNCH_MARKER_PREFIX = "=== EditorBridge launch"
 
 DEFAULT_TIMEOUT = 30.0
 LIVE_WINDOW_S = 2.0      # heartbeat younger than this = editor alive
+
+# Test seam for the launch version probe: set to a runner(cmd)->str callable
+# to keep unit tests from spawning processes (None = real subprocess).
+VERSION_RUNNER = None
 LAUNCH_DEADLINE_S = 300.0  # first run after an engine upgrade reimports everything
 OUTBOX_PURGE_AGE_S = 120.0  # outbox files older than this are pruned on CLI start
 BINARY_CONFIG = os.path.join(PROJECT_ROOT, ".godot-editor-path")
@@ -464,6 +468,15 @@ class EditorBridgeClient:
             print("Set GODOT_EDITOR_BINARY env var, write the binary path to %s,"
                   " or install Godot 4.x." % BINARY_CONFIG, file=sys.stderr)
             sys.exit(1)
+
+        # Version gate: refuse engines below the supported floor BEFORE
+        # spawning (a 3.x/old-4.x editor silently mis-behaves in ways an
+        # agent cannot debug). VERSION_RUNNER is the test seam.
+        gate = cli_proc.launch_version_gate(
+            cli_proc.version_probe_text(binary, runner=VERSION_RUNNER))
+        if gate:
+            raise EditorBridgeError(gate["message"], reason=gate["reason"],
+                                    suggested=gate["suggested"])
 
         cmd = [binary, "--editor", "--path", proj]
         print("Launching: %s --editor --path %s" % (binary, rel(proj)), file=sys.stderr)
