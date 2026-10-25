@@ -103,7 +103,7 @@ jobs:
         # editor (start_new_session), so an xvfb-run wrapper would take the
         # X server down when the CLI process exits.
         run: |
-          Xvfb :99 -screen 0 1280x720x24 &
+          Xvfb :99 -screen 0 1280x720x24 >/dev/null 2>&1 &
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
       - name: Drive the bridge end-to-end
         run: |
