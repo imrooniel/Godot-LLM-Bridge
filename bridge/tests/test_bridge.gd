@@ -152,8 +152,19 @@ func _initialize() -> void:
 	# 127.0.0.1:5555 (its _ready() opens the server in debug builds) and would
 	# answer the probe, making "no server" false.
 	var proxy = load("res://bridge/editor_bridge/game_proxy.gd").new()
-	await process_frame
-	_check("game_proxy.is_reachable() false with no server", proxy.is_reachable() == false)
+	# The listener closes when queue_free() actually frees the bridge (end of
+	# frame, fd release after that) — a single process_frame is NOT enough and
+	# raced into false failures (CI 4.7.2 ubuntu + dev box, 2026-10-25).
+	# Retry until the probe reads clean: exits in ~1 frame when the port is
+	# already closed, tolerates up to ~2s of teardown lag.
+	var tries := 0
+	while tries < 20 and proxy.is_reachable():
+		proxy.reset()
+		await process_frame
+		OS.delay_msec(100)
+		tries += 1
+	_check("game_proxy.is_reachable() false with no server (settled in %d tries)" % tries,
+			proxy.is_reachable() == false)
 	proxy.reset()
 
 	print("")

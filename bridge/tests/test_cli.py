@@ -46,23 +46,23 @@ PS_TRUNCATED = (
 
 class TestProcMatching(unittest.TestCase):
     def test_editor_and_game_split(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR, os_name="posix")
         self.assertEqual([p for p, _ in r["editors"]], [101])
         self.assertEqual([p for p, _ in r["games"]], [102])
 
     def test_other_project_ignored(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ, os_name="posix")
         self.assertEqual(r["editors"], [])
         self.assertEqual(r["games"], [])
 
     def test_game_only_not_editor(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY, os_name="posix")
         self.assertEqual(r["editors"], [])
         self.assertEqual([p for p, _ in r["games"]], [301])
 
     def test_truncated_path_not_matched(self):
         # A2(b): a truncated --path must NOT be treated as this project.
-        r = cp.find_godot_procs(PROJ, ps_out=PS_TRUNCATED)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_TRUNCATED, os_name="posix")
         self.assertEqual(r["editors"], [])
 
     def test_percent20_normalized(self):
@@ -110,7 +110,7 @@ class TestLaunchPreflight(unittest.TestCase):
     def _preflight(self, ps_out, project=PROJ):
         # Mirror the exact decision the CLI makes (imported after Task 1 wires
         # it in; until then this asserts against the helper contract).
-        r = cp.find_godot_procs(project, ps_out=ps_out)
+        r = cp.find_godot_procs(project, ps_out=ps_out, os_name="posix")
         return r
 
     def test_refuse_when_editor_running(self):
@@ -236,24 +236,24 @@ class TestRestartForce(unittest.TestCase):
     def test_preflight_suppressed_when_force(self):
         # With force=True, a running editor must NOT block (restart already
         # quit it; a lingering pid is force-killed, not a reason to refuse).
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR, os_name="posix")
         self.assertTrue(cp.launch_should_refuse(r, force=True) is False)
     def test_preflight_refuses_when_not_force(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR, os_name="posix")
         self.assertTrue(cp.launch_should_refuse(r, force=False) is True)
 
 
 class TestOrphanKill(unittest.TestCase):
     def test_orphan_kill_flag(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY, os_name="posix")
         self.assertTrue(cp.should_kill_orphans(r, force=True))
     def test_orphan_not_killed_without_force(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY, os_name="posix")
         self.assertFalse(cp.should_kill_orphans(r, force=False))
     def test_no_kill_when_no_games(self):
         # The bool(procs["games"]) half of the `and`: force alone is not enough
         # when there is no orphan game to kill.
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ, os_name="posix")
         self.assertFalse(cp.should_kill_orphans(r, force=True))
 
 
@@ -893,9 +893,11 @@ class TestErrorSurfaceGuarantee(unittest.TestCase):
         # a BaseException — it bypasses every handler in main(). Failures
         # must go through EditorBridgeError / classed prints instead.
         src = open(os.path.join(os.path.dirname(__file__), "..", "cli",
-                                "editor_bridge_cli.py")).read()
+                                "editor_bridge_cli.py"),
+                   encoding="utf-8").read()
         src += open(os.path.join(os.path.dirname(__file__), "..", "cli",
-                                 "cli_proc.py")).read()
+                                 "cli_proc.py"),
+                    encoding="utf-8").read()
         self.assertNotIn("raise SystemExit", src)
 
 
