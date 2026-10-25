@@ -888,5 +888,111 @@ class TestErrorSurfaceGuarantee(unittest.TestCase):
         self.assertFalse(payload["ok"])
 
 
+    def test_no_systemexit_raises_in_cli_source(self):
+        # Guard the invariant that closed the audit (Task 15): SystemExit is
+        # a BaseException — it bypasses every handler in main(). Failures
+        # must go through EditorBridgeError / classed prints instead.
+        src = open(os.path.join(os.path.dirname(__file__), "..", "cli",
+                                "editor_bridge_cli.py")).read()
+        src += open(os.path.join(os.path.dirname(__file__), "..", "cli",
+                                 "cli_proc.py")).read()
+        self.assertNotIn("raise SystemExit", src)
+
+
+class TestWindowsProcessParity(unittest.TestCase):
+    """Task 16: Windows process handling through injectable seams.
+    All tests run on Linux with injected fakes; the real Windows proof is
+    the CI cli matrix (Windows runner) + the owner smoke checklist
+    (docs/HUMAN_GUIDE.md)."""
+
+    CSV = ('"ProcessId","CommandLine"\r\n'
+           '"111","C:\\Godot\\Godot_v4.7.2.exe --editor --path '
+           'C:\\Games\\MyGame"\r\n'
+           '"222","C:\\Godot\\Godot_v4.7.2.exe --path C:\\Games\\MyGame '
+           '--editor-pid 111"\r\n'
+           '"333","C:\\Windows\\notepad.exe"\r\n')
+
+    def test_windows_ps_command_shape(self):
+        cmd = cp.windows_ps_command()
+        self.assertEqual(cmd[0], "powershell")
+        joined = " ".join(cmd)
+        self.assertIn("Get-CimInstance", joined)
+        self.assertIn("Win32_Process", joined)
+        self.assertIn("ConvertTo-Csv", joined)
+
+    def test_parse_windows_procs(self):
+        procs = cp.parse_windows_procs(self.CSV)
+        self.assertEqual([p for p, _ in procs], [111, 222, 333])
+        self.assertTrue(cp.is_godot_editor(procs[0][1]))
+        self.assertTrue(cp.is_godot_game(procs[1][1]))
+        self.assertFalse(cp.is_godot_editor(procs[2][1]))
+        self.assertFalse(cp.is_godot_game(procs[2][1]))
+
+    def test_parse_windows_procs_malformed(self):
+        self.assertEqual(cp.parse_windows_procs(""), [])
+        self.assertEqual(cp.parse_windows_procs(None), [])
+        # junk rows (no int pid) are skipped, valid kept
+        procs = cp.parse_windows_procs('"ProcessId","CommandLine"\r\n'
+                                       '"abc","x"\r\n"7","godot --editor"\r\n')
+        self.assertEqual(procs, [(7, "godot --editor")])
+
+    def test_find_godot_procs_windows_branch(self):
+        procs = cp.find_godot_procs("C:\\Games\\MyGame", os_name="nt",
+                                    runner=lambda cmd: self.CSV)
+        self.assertEqual([p for p, _ in procs["editors"]], [111])
+        self.assertEqual([p for p, _ in procs["games"]], [222])
+
+    def test_find_godot_procs_windows_other_project_ignored(self):
+        procs = cp.find_godot_procs("C:\\Games\\Other", os_name="nt",
+                                    runner=lambda cmd: self.CSV)
+        self.assertEqual(procs, {"editors": [], "games": []})
+
+    def test_pid_alive_impl(self):
+        self.assertEqual(cp.pid_alive_impl("nt"), "pid_list")
+        self.assertEqual(cp.pid_alive_impl("posix"), "signal0")
+        self.assertEqual(cp.pid_alive_impl("posix2"), "signal0")
+
+    def test_kill_command(self):
+        self.assertEqual(cp.kill_command(4242, "nt"),
+                         ["taskkill", "/PID", "4242", "/F"])
+        self.assertEqual(cp.kill_command(4242, "posix"),
+                         ["kill", "-9", "4242"])
+
+    def test_kill_pid_nt_uses_taskkill_via_runner(self):
+        seen = {}
+
+        def runner(cmd):
+            seen["cmd"] = cmd
+            return ""
+
+        self.assertTrue(cp.kill_pid(4242, runner=runner, os_name="nt"))
+        self.assertEqual(seen["cmd"], ["taskkill", "/PID", "4242", "/F"])
+
+    def test_kill_pid_nt_failure_degrades_false(self):
+        def boom(cmd):
+            raise OSError("no taskkill")
+        self.assertFalse(cp.kill_pid(4242, runner=boom, os_name="nt"))
+
+    def test_pid_alive_nt_never_signals_uses_list(self):
+        # os.kill on Windows TERMINATES for any non-CTRL signal (incl. 0) —
+        # the nt route must consult the process list, never os.kill.
+        alive = cp.pid_alive(222, os_name="nt",
+                             runner=lambda cmd: self.CSV)
+        self.assertTrue(alive)
+        self.assertFalse(cp.pid_alive(999, os_name="nt",
+                                      runner=lambda cmd: self.CSV))
+
+    def test_pid_alive_nt_probe_failure_false(self):
+        def boom(cmd):
+            raise OSError("powershell missing")
+        self.assertFalse(cp.pid_alive(222, os_name="nt", runner=boom))
+
+    def test_pid_alive_posix_regression_signal0(self):
+        # signal-0 route unchanged on posix: our own pid is alive, huge pid
+        # is not.
+        self.assertTrue(cp.pid_alive(os.getpid()))
+        self.assertFalse(cp.pid_alive(2 ** 40))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
