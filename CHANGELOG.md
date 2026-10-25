@@ -4,16 +4,18 @@ All notable changes to Godot LLM Bridge are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.0] - unreleased
+## [3.0.0] - 2026-10-26
 
 Open-source Community Edition release.
 
 > **Requirement (owner ruling, 2026-10-25): Godot 4.8 only.** The bridge
 > requires the 4.8 engine — 4.7 and below are unsupported (`launch` refuses
 > them, `doctor` fails them, CI is gated on the official 4.8-beta1 milestone
-> until 4.8-stable ships). `VERSION` at the repo root is the
-single source of truth for versioning; `scripts/check_version.py` (and CI)
-verify both `bridge/*/plugin.cfg` files match it.
+> until 4.8-stable ships).
+
+`VERSION` at the repo root is the single source of truth for versioning;
+`scripts/check_version.py` (and CI) verify both `bridge/*/plugin.cfg` files
+match it.
 
 ### Added — community infrastructure
 
@@ -72,14 +74,6 @@ verify both `bridge/*/plugin.cfg` files match it.
   game-specific `game.*` handlers, keeping the core bridge game-agnostic.
 - Custom-handler documentation: `bridge/game/GUIDE.md` and the
   `debug-bridge` skill cover registering and dispatching custom handlers.
-
-### Unreleased — finalization before the 3.0.0 tag
-
-- `doctor` command: environment and setup diagnostics.
-- `launch` version gate: warn on unsupported Godot versions.
-- Error-UX sweep: consistent, actionable messages across all failure paths.
-- Windows parity pass for launch/process handling.
-- Polished installation docs for the open-source release.
 
 ## [2.0.0]
 
