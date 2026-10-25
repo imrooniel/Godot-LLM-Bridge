@@ -10,6 +10,7 @@ Findings addressed: A2 (proc matching), A3 (path validation), C1/C2
 (orphan game detection), C3 (pid liveness vs heartbeat age).
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -318,7 +319,7 @@ def _parse_ver(s):
 
 def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
                     python_version, godot_version_out, heartbeat_age_s,
-                    os_name):
+                    os_name, heartbeat_stale_s=2.0):
     """Diagnose a bridge install from static facts only (no live editor).
 
     Returns a list of Check dicts: {name, status: ok|fail|warn, detail, fix}.
@@ -382,9 +383,12 @@ def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
         add("godot_binary", "ok", "Godot binary answers: %s"
             % str(godot_version_out).strip())
 
-    # Autoload registration.
-    joined = "\n".join(autoload_lines)
-    if "DebugBridge=" in joined:
+    # Autoload registration — anchored match: a near-name
+    # (MyDebugBridge=) or a commented line (already filtered upstream in
+    # the reader) must NOT read as registered.
+    registered = any(re.match(r"\s*DebugBridge\s*=", line)
+                     for line in autoload_lines)
+    if registered:
         add("autoload_debug_bridge", "ok", "DebugBridge autoload registered")
     else:
         add("autoload_debug_bridge", "fail",
@@ -392,8 +396,11 @@ def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
             "Add to project.godot [autoload]: "
             'DebugBridge="*res://bridge/autoloads/debug_bridge.gd"')
 
-    # Editor plugins (both must be enabled).
-    plugins_blob = "\n".join(plugin_lines)
+    # Editor plugins (both must be enabled). Comment lines are filtered
+    # defensively (the CLI reader strips them too): a commented-out
+    # registration is NOT registered.
+    plugins_blob = "\n".join(l for l in plugin_lines
+                             if not l.strip().startswith(";"))
     needed = ["res://bridge/editor_bridge/plugin.cfg",
               "res://bridge/human_edit/plugin.cfg"]
     missing = [p for p in needed if p not in plugins_blob]
@@ -414,7 +421,7 @@ def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
             "no editor heartbeat (state.json missing) — editor not running?",
             "Start the editor through the CLI: `... editor_bridge_cli.py "
             "launch` (this is fine if you only wanted a setup check).")
-    elif heartbeat_age_s > 2.0:
+    elif heartbeat_age_s > heartbeat_stale_s:
         add("editor_heartbeat", "warn",
             "editor heartbeat stale (%.1fs old) — editor closed or busy?"
             % heartbeat_age_s,

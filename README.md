@@ -132,9 +132,10 @@ your autoload: `get_node("/root/DebugBridge").register_handler("my_query", calla
 ## Troubleshooting
 
 **First move: `python3 bridge/cli/editor_bridge_cli.py doctor`.** It checks
-Python, Godot discovery, project registration, autoload/plugin wiring, the
-mailbox, and the game bridge, and prints the next command to run per
-failure. Paste its output when asking for help.
+the project file, Godot feature floor and binary discovery, Python,
+autoload/plugin registration, editor heartbeat, and OS support — each
+failure prints the fix, and it runs with no editor open. Paste its output
+when asking for help.
 
 | Symptom | Likely cause / fix |
 |---|---|

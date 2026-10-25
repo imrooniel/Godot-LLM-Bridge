@@ -1431,6 +1431,8 @@ def _doctor_read_project(proj: str):
     autoload, plugins = [], []
     for line in lines:
         s = line.strip()
+        if s.startswith(";"):  # Godot INI comment — a commented-out
+            continue           # registration line is NOT registered
         if s.startswith("[") and s.endswith("]"):
             section = s[1:-1]
             continue
@@ -1484,6 +1486,18 @@ def _doctor_godot_version(proj: str):
                 binp = found
                 break
     if binp is None:
+        # Fall back to the launcher's full discovery (registry on Windows,
+        # common install locations) so doctor never claims a hard miss for a
+        # binary `launch` would actually find. Silence its advisory prints —
+        # doctor output is check lines only.
+        _out, _err = sys.stdout, sys.stderr
+        try:
+            import io
+            sys.stdout = sys.stderr = io.StringIO()
+            binp = _find_godot_binary()
+        finally:
+            sys.stdout, sys.stderr = _out, _err
+    if binp is None:
         return None
     try:
         out = subprocess.run([binp, "--version"], capture_output=True,
@@ -1534,7 +1548,12 @@ def main() -> None:
         args.log_type = "get"
     if args.command == "doctor":
         # Static diagnosis by design: runs with no editor, no mailbox I/O.
-        sys.exit(run_doctor(args.path, args.as_json))
+        try:
+            sys.exit(run_doctor(args.path, args.as_json))
+        except Exception as e:  # never dump a raw traceback from doctor
+            print("doctor error: %s (report this with --path value)" % e,
+                  file=sys.stderr)
+            sys.exit(2)
     client = EditorBridgeClient()
     _GLOBAL_CLIENT = client
 

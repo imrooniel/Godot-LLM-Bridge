@@ -629,6 +629,25 @@ class TestDoctorEvaluate(unittest.TestCase):
             self.assertEqual(sorted(c.keys()), ["detail", "fix", "name", "status"])
             self.assertIn(c["status"], ("ok", "warn", "fail"))
 
+    def test_commented_autoload_is_not_registered(self):
+        # Godot INI comment char: ';DebugBridge=...' means NOT registered.
+        lines = [';DebugBridge="*res://bridge/autoloads/debug_bridge.gd"']
+        c = self._by_name(self._checks(autoload_lines=lines),
+                          "autoload_debug_bridge")
+        self.assertEqual(c["status"], "fail")
+
+    def test_near_name_autoload_is_not_registered(self):
+        c = self._by_name(
+            self._checks(autoload_lines=['MyDebugBridge="*res://x.gd"']),
+            "autoload_debug_bridge")
+        self.assertEqual(c["status"], "fail")
+
+    def test_commented_plugins_are_not_enabled(self):
+        lines = [';enabled=PackedStringArray("res://bridge/editor_bridge/'
+                 'plugin.cfg", "res://bridge/human_edit/plugin.cfg")']
+        c = self._by_name(self._checks(plugin_lines=lines), "editor_plugins")
+        self.assertEqual(c["status"], "fail")
+
 
 class TestDoctorCliWiring(unittest.TestCase):
     def test_parser_accepts_doctor_flags(self):
