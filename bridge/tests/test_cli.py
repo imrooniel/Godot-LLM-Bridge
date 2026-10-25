@@ -812,10 +812,15 @@ class TestErrorSurfaceGuarantee(unittest.TestCase):
         import tempfile
         tmp = tempfile.mkdtemp()
         try:
-            shutil.copy(self.CLI, os.path.join(tmp, "cli_x.py"))
+            # Mirror the contractual <project>/bridge/cli/ layout so PROJECT
+            # _ROOT resolves to the (project.godot-less) tmp root.
+            dest = os.path.join(tmp, "bridge", "cli")
+            os.makedirs(dest)
+            shutil.copy(self.CLI, os.path.join(dest, "editor_bridge_cli.py"))
             shutil.copy(os.path.join(os.path.dirname(self.CLI), "cli_proc.py"),
-                        tmp)
-            proc = subprocess.run([sys.executable, os.path.join(tmp, "cli_x.py"),
+                        dest)
+            proc = subprocess.run([sys.executable,
+                                   os.path.join(dest, "editor_bridge_cli.py"),
                                    "launch"],
                                   capture_output=True, text=True, timeout=30,
                                   env=self._env())

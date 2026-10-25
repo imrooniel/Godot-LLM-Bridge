@@ -215,6 +215,12 @@ _REASON_CLASS = {
     "method_not_found": "bad_request",
     "policy_rejected": "policy_rejected",
     "godot_version": "godot_version",
+    "bad_args": "bad_args",
+    "bad_project": "bad_project",
+    "godot_binary": "godot_binary",
+    "editor_running": "editor_running",
+    "launch_failed": "launch_failed",
+    "unexpected": "unexpected",
 }
 _CODE_CLASS = {
     -32603: "load_failed",

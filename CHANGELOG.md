@@ -12,6 +12,13 @@ verify both `bridge/*/plugin.cfg` files match it.
 
 ### Added — community infrastructure
 
+- Error-surface guarantee: every non-zero CLI exit now prints
+  `Error [<class>]:` + at least one `suggested:` line — argparse usage errors
+  (`bad_args`), editor-down, launch refusals (`bad_project`, `godot_binary`,
+  `editor_running`, `launch_failed`), game logic/transport errors, and an
+  `unexpected` catch-all (report URL included). No bare tracebacks, ever
+  (subprocess tests pin it). `doctor` is the documented exception: its exit
+  1 is a diagnosis result with structured output, not an invocation error.
 - Launch version gate: `launch` (and therefore `restart`/`recover`) probes
   `<binary> --version --headless` and refuses engines below the supported
   floor (4.7 today) with `Error [godot_version]` + install/repin suggestions
