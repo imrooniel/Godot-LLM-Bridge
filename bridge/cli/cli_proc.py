@@ -221,6 +221,9 @@ _REASON_CLASS = {
     "editor_running": "editor_running",
     "launch_failed": "launch_failed",
     "unexpected": "unexpected",
+    "scene_already_open": "scene_already_open",
+    "game_playing": "game_playing",
+    "dap_timeout": "dap_timeout",
 }
 _CODE_CLASS = {
     -32603: "load_failed",

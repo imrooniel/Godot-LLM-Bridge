@@ -302,9 +302,18 @@ def _parse_json_params(raw: str) -> dict:
     try:
         val = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"--json-params is not valid JSON: {e}")
+        raise EditorBridgeError(
+            "--json-params is not valid JSON: %s" % e,
+            reason="bad_args",
+            suggested=[
+                "pass a JSON object, e.g. --json-params '{\"key\": \"value\"}'",
+                "omitted or empty means no parameters",
+            ])
     if not isinstance(val, dict):
-        raise SystemExit("--json-params must be a JSON object ({...})")
+        raise EditorBridgeError(
+            "--json-params must be a JSON object ({...})",
+            reason="bad_args",
+            suggested=["wrap the parameters in { } keyed by parameter name"])
     return val
 
 
@@ -1713,8 +1722,14 @@ def main() -> None:
             if args.action_type == "scene-open":
                 path = _resolved_path(args)
                 if path in state.get("scenes", {}).get("open", []):
-                    print("Scene already open: %s" % path, file=sys.stderr)
-                    sys.exit(1)
+                    raise EditorBridgeError(
+                        "already open: %s" % path,
+                        reason="scene_already_open",
+                        suggested=[
+                            "close it first: `action scene-close --path %s`"
+                            % path,
+                            "or use the open instance (see `query state`)",
+                        ])
                 result = client.rpc("action.scene.open", {"path": path})
             elif args.action_type == "scene-close":
                 result = client.rpc("action.scene.close", {"path": args.path})
@@ -1724,10 +1739,15 @@ def main() -> None:
                 result = client.rpc("action.scene.save_all", {})
             elif args.action_type == "scene-play":
                 if state.get("game", {}).get("running"):
-                    print("Error: game already playing %s"
-                          % state["game"].get("playing_scene"), file=sys.stderr)
-                    print("Run: editor_bridge_cli.py action scene-stop", file=sys.stderr)
-                    sys.exit(1)
+                    raise EditorBridgeError(
+                        "game already playing %s"
+                        % state["game"].get("playing_scene"),
+                        reason="game_playing",
+                        suggested=[
+                            "stop it first: `action scene-stop`",
+                            "or inspect the running game instead: "
+                            "`game scene-info`",
+                        ])
                 result = client.rpc("action.scene.play", {"path": args.path or ""})
             elif args.action_type == "scene-stop":
                 result = client.rpc("action.scene.stop", {})
@@ -1936,7 +1956,14 @@ def main() -> None:
                         alive = True
                     except (EditorBridgeError, EditorBridgeNotRunning):
                         pass
-                    print(cli_proc.dap_timeout_message(alive), file=sys.stderr)
+                    print("Error [dap_timeout]: %s"
+                          % cli_proc.dap_timeout_message(alive),
+                          file=sys.stderr)
+                    print("  suggested: run `debugger state` — a PAUSED game "
+                          "blocks DAP requests; `debugger continue` resumes",
+                          file=sys.stderr)
+                    print("  suggested: `recover` once if editor or game is "
+                          "wedged", file=sys.stderr)
                     sys.exit(1)
                 raise
             print(json.dumps(_contract_ok(result, _current_state()), indent=2))

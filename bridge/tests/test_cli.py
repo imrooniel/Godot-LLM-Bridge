@@ -795,12 +795,28 @@ class TestErrorSurfaceGuarantee(unittest.TestCase):
     def test_missing_required_args(self):
         self._assert_clean_error(self._run("game", "get", "Some/Node"))
 
-    def test_bad_json_params(self):
-        self._assert_clean_error(
-            self._run("game", "rpc", "anything", "--json-params", "{not json"))
+    def test_bad_json_params_raises_classed_error(self):
+        # In-process pin: the subprocess game path pings the editor BEFORE
+        # parsing --json-params, so only a direct call proves the parse
+        # itself fails classed (SystemExit leaks sailed past every guard).
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._parse_json_params("{not json")
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertIn("not valid JSON", str(ctx.exception))
+        self.assertTrue(ctx.exception.suggested)
+
+    def test_non_object_json_params_raises_classed_error(self):
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._parse_json_params("[1, 2]")
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertTrue(ctx.exception.suggested)
 
     def test_game_command_without_editor(self):
-        # The community worktree has no editor on its mailbox in CI.
+        # Hermetic skip: a dev editor on this mailbox makes editor_down
+        # unassertable here (CI runners are always clean).
+        if self._run("ping").returncode == 0:
+            self.skipTest("live editor answers this mailbox; editor_down "
+                          "surface not assertable")
         proc = self._run("game", "scene-info")
         self.assertIn(proc.returncode, (1, 2))
         self.assertIn("Error [", proc.stderr, proc.stderr)
