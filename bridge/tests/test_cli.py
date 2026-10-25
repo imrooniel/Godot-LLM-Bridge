@@ -529,5 +529,140 @@ class TestRpcParamsAlias(unittest.TestCase):
         self.assertEqual(args.json_params, '{"x": 3}')
 
 
+class TestDoctorEvaluate(unittest.TestCase):
+    """doctor_evaluate: pure setup diagnosis (no live editor needed)."""
+
+    def _checks(self, **over):
+        base = dict(
+            project_exists=True,
+            features="4.8",
+            autoload_lines=['DebugBridge="*res://bridge/autoloads/debug_bridge.gd"'],
+            plugin_lines=['enabled=PackedStringArray("res://bridge/editor_bridge/plugin.cfg", "res://bridge/human_edit/plugin.cfg")'],
+            python_version=(3, 11),
+            godot_version_out="4.8.dev.custom_build.34d06658a",
+            heartbeat_age_s=0.3,
+            os_name="Linux",
+        )
+        base.update(over)
+        return cp.doctor_evaluate(**base)
+
+    def _by_name(self, checks, name):
+        for c in checks:
+            if c["name"] == name:
+                return c
+        return None
+
+    def test_healthy_fixture_all_ok(self):
+        checks = self._checks()
+        self.assertTrue(checks)
+        for c in checks:
+            self.assertEqual(c["status"], "ok", "%s: %s" % (c["name"], c["detail"]))
+
+    def test_missing_project_fails_with_root_fix(self):
+        checks = self._checks(project_exists=False)
+        c = self._by_name(checks, "project_godot")
+        self.assertIsNotNone(c)
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("project root", c["fix"])
+
+    def test_feature_below_floor_fails(self):
+        c = self._by_name(self._checks(features="4.6"), "godot_features")
+        self.assertEqual(c["status"], "fail")
+        self.assertEqual(c["name"], "godot_features")
+        self.assertIn("4.7", c["detail"] + c["fix"])
+
+    def test_feature_4_7_warns_dap_needs_4_8(self):
+        c = self._by_name(self._checks(features="4.7"), "godot_features")
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("4.8", c["detail"])
+
+    def test_feature_4_8_plus_ok(self):
+        for f in ("4.8", "4.9", "5.0"):
+            c = self._by_name(self._checks(features=f), "godot_features")
+            self.assertEqual(c["status"], "ok", f)
+
+    def test_missing_autoload_line_fails_with_exact_fix(self):
+        c = self._by_name(self._checks(autoload_lines=[]), "autoload_debug_bridge")
+        self.assertEqual(c["status"], "fail")
+        self.assertIn('DebugBridge="*res://bridge/autoloads/debug_bridge.gd"', c["fix"])
+
+    def test_missing_plugin_lines_fails_with_exact_fix(self):
+        c = self._by_name(self._checks(plugin_lines=[]), "editor_plugins")
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("res://bridge/editor_bridge/plugin.cfg", c["fix"])
+        self.assertIn("res://bridge/human_edit/plugin.cfg", c["fix"])
+
+    def test_partial_plugins_still_fail(self):
+        lines = ['enabled=PackedStringArray("res://bridge/editor_bridge/plugin.cfg")']
+        c = self._by_name(self._checks(plugin_lines=lines), "editor_plugins")
+        self.assertEqual(c["status"], "fail")
+
+    def test_no_godot_binary_fails(self):
+        c = self._by_name(self._checks(godot_version_out=None), "godot_binary")
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("GODOT_EDITOR_BINARY", c["fix"])
+
+    def test_fresh_heartbeat_ok(self):
+        c = self._by_name(self._checks(heartbeat_age_s=0.5), "editor_heartbeat")
+        self.assertEqual(c["status"], "ok")
+
+    def test_stale_heartbeat_warns(self):
+        c = self._by_name(self._checks(heartbeat_age_s=45.0), "editor_heartbeat")
+        self.assertEqual(c["status"], "warn")
+
+    def test_no_heartbeat_warns_not_fails(self):
+        # doctor works without a running editor — warn, with launch as the fix
+        c = self._by_name(self._checks(heartbeat_age_s=None), "editor_heartbeat")
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("launch", c["fix"])
+
+    def test_python_below_3_9_fails(self):
+        c = self._by_name(self._checks(python_version=(3, 8)), "python_version")
+        self.assertEqual(c["status"], "fail")
+
+    def test_macos_warns_unsupported(self):
+        c = self._by_name(self._checks(os_name="Darwin"), "os_support")
+        self.assertEqual(c["status"], "warn")
+
+    def test_check_shape(self):
+        for c in self._checks():
+            self.assertEqual(sorted(c.keys()), ["detail", "fix", "name", "status"])
+            self.assertIn(c["status"], ("ok", "warn", "fail"))
+
+
+class TestDoctorCliWiring(unittest.TestCase):
+    def test_parser_accepts_doctor_flags(self):
+        p = ebc.build_parser()
+        args = p.parse_args(["doctor", "--path", "/tmp/x", "--json"])
+        self.assertEqual(args.command, "doctor")
+        self.assertEqual(args.path, "/tmp/x")
+        self.assertTrue(args.as_json)
+
+    def test_doctor_defaults_path_cwd(self):
+        args = ebc.build_parser().parse_args(["doctor"])
+        self.assertEqual(args.path, ".")
+        self.assertFalse(args.as_json)
+
+    def test_doctor_json_in_empty_dir_exits_1_with_project_fail(self):
+        import json as _json
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            proc = subprocess.run(
+                [sys.executable,
+                 os.path.join(os.path.dirname(__file__), "..", "cli",
+                              "editor_bridge_cli.py"),
+                 "doctor", "--path", tmp, "--json"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            payload = _json.loads(proc.stdout)
+            self.assertFalse(payload["ok"])
+            names = {c["name"]: c for c in payload["checks"]}
+            self.assertEqual(names["project_godot"]["status"], "fail")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
