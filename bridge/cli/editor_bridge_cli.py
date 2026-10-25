@@ -528,14 +528,13 @@ class EditorBridgeClient:
         kwargs = dict(stdout=log_file, stderr=subprocess.STDOUT,
                       stdin=subprocess.DEVNULL,
                       close_fds=True)
-        # A1: detach so Ctrl-C / the CLI parent's death won't take the editor
-        # with it. `start_new_session` is a Popen kwarg (setsid on POSIX), NOT a
-        # `subprocess` module attribute — the old `hasattr(subprocess,
-        # "start_new_session")` guard was ALWAYS False, so the detach silently
-        # never applied. On Windows the kwarg raises ValueError, so guard on the
-        # platform (this project is Linux-only in practice).
-        if os.name == "posix":
-            kwargs["start_new_session"] = True
+        # A1: detach so Ctrl-C / console close / the CLI parent's death
+        # won't take the editor down with unsaved edits. Platform decision
+        # lives in cli_proc.spawn_detach_kwargs (unit-pinned both branches):
+        # setsid on posix; DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP on
+        # Windows (stdio is already redirected to the log file above, which
+        # DETACHED_PROCESS requires).
+        kwargs.update(cli_proc.spawn_detach_kwargs(os.name))
         proc = subprocess.Popen(cmd, **kwargs)
         try:
             log_file.write(("\n%s %s (editor pid %d) ===\n"

@@ -179,7 +179,10 @@ detached spawn):
    `game_bridge: true`.
 5. Second `launch` → `Error [editor_running]` listing the pid (CIM process
    listing works; a stale/no-match here means `Win32_Process.CommandLine`
-   came back empty for the editor).
+   came back empty for the editor). Note: if PowerShell is restricted
+   (AV / Constrained Language Mode), process probes read as "no processes"
+   and this refusal — like orphan detection — silently weakens; the
+   `game_bridge`/heartbeat paths still work.
 6. `launch --force` → kills that editor (via `taskkill /F`) and relaunches;
    no orphan Godot windows in Task Manager afterwards.
 7. `action scene-play` (with a game running) → `Error [game_playing]`;

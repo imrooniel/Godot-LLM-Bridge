@@ -67,12 +67,31 @@ def is_godot_game(cmdline: str) -> bool:
     return bool(tokens) and "--editor-pid" in tokens and "--editor" not in tokens
 
 
-def proc_path_arg(cmdline: str) -> str:
+_CMDLINE_TOKEN_RE = re.compile(r'"[^"]*"|\S+')
+
+
+def split_cmdline(cmdline: str) -> list:
+    """Tokenize a raw Windows command line (CIM form) keeping QUOTED runs
+    intact — `--path "C:\\My Game, 2D"` must survive as two tokens; naive
+    .split() fragments paths with spaces (double-editor guard blindspot).
+    """
+    return [t[1:-1] if len(t) >= 2 and t.startswith('"') and t.endswith('"')
+            else t for t in _CMDLINE_TOKEN_RE.findall(cmdline or "")]
+
+
+def proc_path_arg(cmdline: str, win32: bool = False) -> str:
     """Return the value of the first `--path <value>` in a cmdline, else "".
 
     Handles the engine's `%20`-encoded spaces and trailing slashes so the
     result can be normalized and compared to the project root (fixes A2(b):
     a truncated or normalized `--path` must still be detectable)."""
+    if win32:
+        # Quote-aware tokenizer FIRST: the naive split below fragments a
+        # quoted `--path "C:\\My Game, 2D"` into garbage prefixes.
+        wt = split_cmdline(cmdline)
+        for i, t in enumerate(wt):
+            if t.lower() == "--path" and i + 1 < len(wt):
+                return wt[i + 1].replace("%20", " ")
     tokens = cmdline.split()
     for i, t in enumerate(tokens):
         if t == "--path" and i + 1 < len(tokens):
@@ -80,14 +99,30 @@ def proc_path_arg(cmdline: str) -> str:
     return ""
 
 
-def same_path(a: str, b: str) -> bool:
+def same_path(a: str, b: str, os_name: str = None) -> bool:
     """Path equality after abspath normalization (handles trailing slash,
     `..`, `%20`). Used to decide whether a proc's `--path` targets THIS
-    project."""
+    project.
+
+    On Windows (os_name == "nt") also normcase: Windows paths are
+    case-insensitive, and a launcher- or hand-typed lowercase `--path` must
+    still match PROJECT_ROOT — otherwise the double-editor mailbox guard
+    silently disarms. posix stays case-sensitive (ntpath.normcase is used
+    explicitly so the decision is testable on any host)."""
     if not a or not b:
         return False
-    na = os.path.normpath(os.path.abspath(a))
-    nb = os.path.normpath(os.path.abspath(b))
+    if (os_name or os.name) == "nt":
+        import ntpath
+        # Full ntpath stack: it maps / -> \, drops trailing separators, and
+        # normcase lowercases (Windows paths are case-insensitive) — so a
+        # launcher/hand-typed lowercase --path still matches PROJECT_ROOT
+        # and the double-editor mailbox guard stays armed. Works on any
+        # host for drive-qualified paths (unit-testable from posix).
+        na = ntpath.normcase(ntpath.abspath(a))
+        nb = ntpath.normcase(ntpath.abspath(b))
+    else:
+        na = os.path.normpath(os.path.abspath(a))
+        nb = os.path.normpath(os.path.abspath(b))
     return na == nb
 
 
@@ -125,8 +160,8 @@ def find_godot_procs(project_path: str, ps_out: str = None,
     entries = (parse_windows_procs(ps_out) if is_nt
                else parse_ps(ps_out, pid))
     for p, cmdline in entries:
-        path = proc_path_arg(cmdline)
-        if not same_path(path, project_path):
+        path = proc_path_arg(cmdline, win32=is_nt)
+        if not same_path(path, project_path, os_name):
             continue
         if is_godot_editor(cmdline):
             editors.append((p, cmdline))
@@ -647,3 +682,25 @@ def kill_pid(pid, runner=None, os_name=None):
         return True
     except Exception:
         return False
+
+
+def spawn_detach_kwargs(os_name):
+    """Popen kwargs detaching the spawned editor from the CLI's console.
+
+    Without detachment the editor shares the CLI's console/process group:
+    Ctrl-C or closing the terminal window (CTRL_CLOSE_EVENT) takes the
+    editor down WITH unsaved scene edits — the exact hazard this prevents.
+
+    posix:  start_new_session (setsid). NOTE: Popen kwarg, NOT a subprocess
+            module attribute.
+    Windows: DETACHED_PROCESS (0x8, no console inherited — requires stdio
+            redirected/DEVNULL, which launch() does) +
+            CREATE_NEW_PROCESS_GROUP (0x200, Ctrl-C can't reach it).
+            Constants are literals with getattr fallback: they exist on
+            Windows Python only, but tests run this branch everywhere.
+    """
+    if os_name == "posix":
+        return {"start_new_session": True}
+    return {"creationflags": (getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                              | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP",
+                                        0x200))}

@@ -993,6 +993,51 @@ class TestWindowsProcessParity(unittest.TestCase):
         self.assertTrue(cp.pid_alive(os.getpid()))
         self.assertFalse(cp.pid_alive(2 ** 40))
 
+    # --- review fixes: detached spawn on nt + Windows path case ----------
+
+    CSV_RICH = ('"ProcessId","CommandLine"\r\n'
+                '"10","C:\\godot\\GODOT.exe --editor-pid 111 --path '
+                'c:\\games\\mygame"\r\n'
+                '"9","C:\\Program Files\\Godot X\\godot_landed.exe '
+                '--editor --path ""C:\\My Game, 2D"""\r\n')
+
+    def test_spawn_detach_kwargs_posix(self):
+        self.assertEqual(cp.spawn_detach_kwargs("posix"),
+                         {"start_new_session": True})
+
+    def test_spawn_detach_kwargs_nt(self):
+        kw = cp.spawn_detach_kwargs("nt")
+        self.assertIn("creationflags", kw)
+        # DETACHED_PROCESS (0x8) so console close can't kill the editor;
+        # CREATE_NEW_PROCESS_GROUP (0x200) so Ctrl-C can't reach it.
+        self.assertEqual(kw["creationflags"] & 0x8, 0x8)
+        self.assertEqual(kw["creationflags"] & 0x200, 0x200)
+
+    def test_same_path_nt_case_insensitive(self):
+        self.assertTrue(cp.same_path("C:\\Games\\MyGame",
+                                     "c:\\games\\mygame", os_name="nt"))
+        self.assertTrue(cp.same_path("C:/Games/MyGame",
+                                     "C:\\Games\\MyGame\\", os_name="nt"))
+
+    def test_same_path_posix_stays_case_sensitive(self):
+        self.assertFalse(cp.same_path("/Games/MyGame", "/games/mygame",
+                                      os_name="posix"))
+        self.assertTrue(cp.same_path("/Games/MyGame", "/Games/MyGame",
+                                     os_name="posix"))
+
+    def test_find_godot_procs_nt_matches_lowercase_proc_path(self):
+        # Editor was started with a lowercase --path (launcher/typed); CLI
+        # project root is title-case. Must STILL match (mailbox guard).
+        procs = cp.find_godot_procs("C:\\Games\\MyGame", os_name="nt",
+                                    runner=lambda cmd: self.CSV_RICH)
+        self.assertEqual([p for p, _ in procs["editors"]], [])
+        self.assertEqual([p for p, _ in procs["games"]], [10])
+
+    def test_find_godot_procs_nt_spaces_and_commas_in_path(self):
+        procs = cp.find_godot_procs("C:\\My Game, 2D", os_name="nt",
+                                    runner=lambda cmd: self.CSV_RICH)
+        self.assertEqual([p for p, _ in procs["editors"]], [9])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
