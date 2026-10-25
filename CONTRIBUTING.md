@@ -76,9 +76,10 @@ Windows, at minimum keep `python bridge\tests\test_cli.py` green locally.
   (commands, flags, output shapes), update the canonical skills under
   `bridge/skills/` in the SAME PR. Downstream mirrors (e.g. consuming
   projects' `.opencode/skills/`) are copies — never edit those here.
-- **Error contract.** Every CLI failure path emits the envelope
-  (`code/message/reason/suggested`) — no bare tracebacks; new failure modes
-  get a `suggested:` pointer to the next command.
+- **Error contract.** CLI failure paths exit nonzero and stay structured:
+  game-command failures emit the envelope (`code/message/reason/suggested`),
+  editor-side paths print `Error [<class>]: <message>` + `suggested:` lines
+  — new code must not emit bare tracebacks and should prefer the envelope.
 - **Python stays stdlib-only** (≥3.9) in `bridge/cli/` and `scripts/`.
 - **Godot support floor**: core bridge features must work on the CI-pinned
   stable; engine-newer features (e.g. 4.8 DAP) must answer structured errors
@@ -101,11 +102,11 @@ under `bridge/`. When you hit a bug while working in such a project:
 2. The consuming project pulls your fix:
    `git subtree pull --prefix=bridge https://github.com/imrooniel/Godot-LLM-Bridge.git master --no-squash`
 3. Or if you fixed it inside the consuming project's `bridge/` prefix first,
-   push it back up:
+   push it back up (commands run **in the consuming project's clone**):
    ```bash
+   git remote add bridge https://github.com/imrooniel/Godot-LLM-Bridge.git  # strangers: your fork's URL
    git subtree split --prefix=bridge -b bridge-upstream
-   git push bridge-upstream   # to THIS repo's remote (fork for strangers)
-   # then PR bridge-upstream → master here
+   git push bridge bridge-upstream   # then PR bridge-upstream → master here
    ```
 
 Never develop features by editing `bridge/` inside a consuming project long
@@ -114,5 +115,5 @@ term — upstream first, pull down after.
 ## Release flow (owner)
 
 Tag `vX.Y.Z` from `master`, update `VERSION` + `CHANGELOG.md` in the release
-commit, GitHub release notes summarize it. Consuming projects subtree-pull
-tags too.
+commit, GitHub release notes summarize it. Consuming projects can
+subtree-pull from a tag ref too.
