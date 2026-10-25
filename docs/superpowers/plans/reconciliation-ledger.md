@@ -81,3 +81,4 @@ arrived with their scripts.
   (`query_scene.gd`, `query_scene_tree.gd`, `action_scene_open.gd`,
   `action_scene_reload.gd`); replace with a neutral example scene path in
   Tasks 2–4.
+- **Update (2026-10-25):** R9 + this docstring cleanup closed the help/docstring residue items — the `change-scene` help and `combat.tscn` example lines above are now historical (command-docstring examples now `res://scenes/main.tscn`; zero `combat` strings in non-test `bridge/` code).

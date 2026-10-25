@@ -1585,7 +1585,7 @@ func _cmd_lua_api(params: Dictionary) -> Dictionary:
 
 # --- execute_lua (main-thread) --------------------------------------------
 ## Handler entry point (kept in _init_handlers). Runs the Lua INLINE on the
-## MAIN thread. This is correct: combat actions (targeting, highlights,
+## MAIN thread. This is correct: gameplay actions (targeting, highlights,
 ## animation presentation, UI) call Godot node methods that MUST run on the
 ## main thread — a background thread makes them fail with "The caller thread
 ## can't call the function on this node". The old background-thread "wedge

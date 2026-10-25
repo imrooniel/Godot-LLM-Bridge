@@ -2,7 +2,7 @@
 extends RefCounted
 
 ## action.scene.reload — reload an open scene from disk.
-## Args: {"path": "res://scenes/combat.tscn"}
+## Args: {"path": "res://scenes/main.tscn"}
 
 func execute(args: Dictionary, ctx) -> Dictionary:
 	var path: String = str(args.get("path", ""))

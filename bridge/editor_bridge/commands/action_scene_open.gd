@@ -2,7 +2,7 @@
 extends RefCounted
 
 ## action.scene.open — open a scene in the editor.
-## Args: {"path": "res://scenes/combat.tscn"}
+## Args: {"path": "res://scenes/main.tscn"}
 ## (the scene_opened event is emitted by the core's state diff)
 
 func execute(args: Dictionary, ctx) -> Dictionary:
