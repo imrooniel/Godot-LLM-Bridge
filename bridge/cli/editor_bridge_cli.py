@@ -287,11 +287,18 @@ def _resolved_path(args) -> str:
     pos = getattr(args, "path_pos", None)
     flag = getattr(args, "path", None)
     if pos and flag and pos != flag:
-        raise SystemExit("path given twice (positional vs --path): %r vs %r"
-                         % (pos, flag))
+        raise EditorBridgeError(
+            "path given twice (positional vs --path): %r vs %r" % (pos, flag),
+            reason="bad_args",
+            suggested=["pass the path ONE way — positional or --path, not "
+                       "both (they must also match)"])
     resolved = pos or flag or ""
     if not resolved:
-        raise SystemExit("a scene path is required (positional or --path)")
+        raise EditorBridgeError(
+            "a scene path is required (positional or --path)",
+            reason="bad_args",
+            suggested=["e.g. `action scene-open res://scenes/main.tscn` or "
+                       "`action scene-open --path res://scenes/main.tscn`"])
     return resolved
 
 

@@ -811,6 +811,25 @@ class TestErrorSurfaceGuarantee(unittest.TestCase):
         self.assertEqual(ctx.exception.reason, "bad_args")
         self.assertTrue(ctx.exception.suggested)
 
+    def test_resolved_path_conflict_raises_classed_error(self):
+        # Same leak family as json-params: bare SystemExit bypassed every
+        # guard (ping-first masked it in subprocess tests).
+        import argparse
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._resolved_path(argparse.Namespace(path_pos="a.tscn",
+                                                  path="b.tscn"))
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertIn("given twice", str(ctx.exception))
+        self.assertTrue(ctx.exception.suggested)
+
+    def test_resolved_path_missing_raises_classed_error(self):
+        import argparse
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._resolved_path(argparse.Namespace(path_pos=None, path=None))
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertIn("required", str(ctx.exception))
+        self.assertTrue(ctx.exception.suggested)
+
     def test_game_command_without_editor(self):
         # Hermetic skip: a dev editor on this mailbox makes editor_down
         # unassertable here (CI runners are always clean).
