@@ -671,24 +671,42 @@ class EditorBridgeClient:
         plan["state"] = self.read_state() or {}
         return plan
 
-    def suite_result(self, which: str) -> dict:
+    def suite_result(self, path: str) -> dict:
         # Read the harness's on-disk result file directly — it survives a
         # bridge drop, so the marker is trustworthy even when the game is
         # paused / unreachable (S2/S8). No editor round-trip, no ping.
-        # The harness persists to user:// (the game process's user-data dir),
-        # so the read must resolve to the same place. The "user://" prefix is
-        # what makes _resolve_user_path map onto _project_user_dir().
-        name = "user://suite_result_%s.json" % which
-        # Resolve user:// (_resolve_user_path is a module-level function, not
-        # a client method).
-        path = _resolve_user_path(name)
-        out = {"file": path, "exists": os.path.exists(path), "marker": "INCOMPLETE"}
-        if os.path.exists(path):
-            with open(path) as f:
+        # Generalized surface (replaces the MW-ism --which main|reset): the
+        # caller passes the file itself — user://, res://-adjacent project-
+        # relative, or absolute. The "user://" prefix is what makes
+        # _resolve_user_path map onto _project_user_dir().
+        resolved = _resolve_user_path(path)
+        if resolved.startswith("res://"):
+            resolved = os.path.join(PROJECT_ROOT, resolved[len("res://"):])
+        elif not os.path.isabs(resolved):
+            resolved = os.path.join(PROJECT_ROOT, resolved)
+        if not os.path.exists(resolved):
+            return _contract_err(
+                {"error": {"code": -32000,
+                           "message": "suite result file not found: %s" % resolved}},
+                _current_state(), "suite_result_missing",
+                suggested=["re-run the test suite (the harness persists the "
+                           "result file)",
+                           "check the --path value (user://, res://, absolute, "
+                           "or project-relative)"])
+        try:
+            with open(resolved) as f:
                 data = json.load(f)
-            out["result"] = data
-            out["marker"] = cli_proc.suite_marker(data)
-        return out
+        except (OSError, ValueError) as e:
+            # ValueError covers json.JSONDecodeError — a corrupt/partial file
+            # must surface as a contract envelope, never a bare traceback.
+            return _contract_err(
+                {"error": {"code": -32000,
+                           "message": "suite result file is not valid JSON: %s (%s)"
+                                      % (resolved, e)}},
+                _current_state(), "suite_result_unreadable",
+                suggested=["re-run the test suite to rewrite the result file"])
+        return {"ok": True, "state": _current_state(), "result": data,
+                "marker": cli_proc.suite_marker(data)}
 
     # --- subscribe / listen -----------------------------------------------
 
@@ -1357,9 +1375,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sr = subparsers.add_parser(
         "suite-result",
-        help="Read the harness's on-disk result file and print the trustworthy "
-             "marker (S2/S8). --which main|reset")
-    sr.add_argument("--which", default="main", choices=["main", "reset"])
+        help="Read a harness result file from disk and print the trustworthy "
+             "marker (S2/S8). --path accepts user://, res://, absolute, or "
+             "project-relative paths.")
+    sr.add_argument("--path", required=True,
+                    help="result file: user://name.json, res://name.json, "
+                         "/abs/path, or project-relative")
 
     return parser
 
@@ -1717,7 +1738,7 @@ def main() -> None:
             print(json.dumps(result, indent=2))
 
         elif args.command == "suite-result":
-            print(json.dumps(client.suite_result(args.which), indent=2))
+            print(json.dumps(client.suite_result(args.path), indent=2))
 
     except EditorBridgeNotRunning as e:
         print("Error: %s" % e, file=sys.stderr)

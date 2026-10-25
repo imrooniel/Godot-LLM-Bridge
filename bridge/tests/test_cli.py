@@ -5,10 +5,13 @@ Run:  python3 bridge/tests/test_cli.py
      or: python3 -m pytest bridge/tests/test_cli.py -v
 No live Godot required.
 """
+import json
 import os
+import platform
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cli"))
 import cli_proc as cp  # noqa: E402
@@ -265,6 +268,199 @@ class TestSuiteResultMarker(unittest.TestCase):
         self.assertEqual(cp.suite_marker({"ok": False, "fail": 0}), "INCOMPLETE")
     def test_incomplete_when_missing(self):
         self.assertEqual(cp.suite_marker(None), "INCOMPLETE")
+
+
+# --- generalized `suite-result --path` (S8 generalization) ------------------
+# All new test method names contain lowercase "suite" so that the case-
+# sensitive `-k suite` filter selects the whole surface regardless of class.
+
+def _fake_home(home: str):
+    """os.path.expanduser replacement: maps a leading "~" to a fake home so
+    resolution tests never touch the real ~/.local."""
+    def expanduser(path):
+        return home + path[1:] if path.startswith("~") else path
+    return expanduser
+
+
+def _app_userdata_base(home: str) -> str:
+    """Mirror of _project_user_dir()'s base computation (same platform
+    branch), anchored at the fake home instead of the real one."""
+    rel = ("~/.local/share/godot/app_userdata" if platform.system() != "Windows"
+           else "~/AppData/Roaming/godot/app_userdata")
+    return home + rel[1:]
+
+
+class TestSuiteMarkerContract(unittest.TestCase):
+    # Pins the marker contract `suite-result` relies on. The green / red /
+    # ok-False cases live in TestSuiteResultMarker above; these cover the
+    # missing-key shapes ("fail"/"total" absent) named in the brief.
+    def test_suite_marker_fail_key_absent_is_incomplete(self):
+        # A dict without "fail" (e.g. only "total") proves the run never
+        # reached the summary write — never trustworthy.
+        self.assertEqual(cp.suite_marker({"ok": True, "total": 5}), "INCOMPLETE")
+
+    def test_suite_marker_empty_dict_is_incomplete(self):
+        self.assertEqual(cp.suite_marker({}), "INCOMPLETE")
+
+
+class TestSuiteUserPathResolution(unittest.TestCase):
+    # _resolve_user_path semantics are KEPT (brief): user:// maps onto the
+    # project's app_userdata dir; everything else passes through. The
+    # project-name read (PROJECT_ROOT) and the home base (expanduser) are
+    # injected — the real ~/.local is never touched.
+    def _resolved(self, proj_name, path, home="/home/fakehome"):
+        import shutil
+        import tempfile
+        root = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(root, "project.godot"), "w") as f:
+                f.write('config_version=5\nconfig/name="%s"\n' % proj_name)
+            with mock.patch.object(ebc, "PROJECT_ROOT", root), \
+                 mock.patch("os.path.expanduser", side_effect=_fake_home(home)):
+                return ebc._resolve_user_path(path)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_suite_user_scheme_maps_onto_app_userdata(self):
+        got = self._resolved("FakeProj", "user://x.json")
+        expected = os.path.join(_app_userdata_base("/home/fakehome"),
+                                "FakeProj", "x.json")
+        self.assertEqual(got, expected)
+
+    def test_suite_absolute_path_passes_through(self):
+        self.assertEqual(self._resolved("FakeProj", "/tmp/suite.json"),
+                         "/tmp/suite.json")
+
+    def test_suite_relative_path_passes_through(self):
+        # The resolver itself is scheme-only; project-relative anchoring on
+        # PROJECT_ROOT happens in suite_result() (TestSuiteResultPath below).
+        self.assertEqual(self._resolved("FakeProj", "out/suite.json"),
+                         "out/suite.json")
+
+
+class TestSuiteResultPath(unittest.TestCase):
+    """`suite-result --path PATH` replaces the MW-ism `--which main|reset`:
+    accepts user://, res://(-adjacent project-relative), or absolute paths;
+    success envelope is {ok, state, result, marker}; an absent file yields the
+    contract error reason="suite_result_missing" — never a bare traceback."""
+
+    def setUp(self):
+        # Real client: __init__ only (re)creates the gitignored .tmp/bridge
+        # mailbox dirs and age-bounded-purges them — safe by construction.
+        self.client = ebc.EditorBridgeClient()
+        self._dirs = []
+
+    def tearDown(self):
+        import shutil
+        while self._dirs:
+            shutil.rmtree(self._dirs.pop(), ignore_errors=True)
+
+    def _tmpdir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self._dirs.append(d)
+        return d
+
+    def _write(self, directory, name, text):
+        path = os.path.join(directory, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def _parse(self, argv):
+        # argparse writes usage/errors to stderr; keep the test output clean.
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            return ebc.build_parser().parse_args(argv)
+
+    # -- parser surface ------------------------------------------------------
+    def test_suite_result_parser_accepts_path(self):
+        args = self._parse(["suite-result", "--path", "user://suite_result_main.json"])
+        self.assertEqual(args.command, "suite-result")
+        self.assertEqual(args.path, "user://suite_result_main.json")
+
+    def test_suite_result_parser_requires_path(self):
+        with self.assertRaises(SystemExit):
+            self._parse(["suite-result"])
+
+    def test_suite_result_parser_rejects_which(self):
+        # The MW-ism is gone: --which must no longer parse.
+        with self.assertRaises(SystemExit):
+            self._parse(["suite-result", "--which", "main"])
+
+    # -- success envelope ----------------------------------------------------
+    def test_suite_result_green_envelope_shape(self):
+        path = self._write(self._tmpdir(), "suite.json",
+                           json.dumps({"ok": True, "fail": 0, "total": 12}))
+        res = self.client.suite_result(path)
+        self.assertEqual(set(res.keys()), {"ok", "state", "result", "marker"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["marker"], "TRUSTWORTHY")
+        self.assertEqual(res["result"]["total"], 12)
+
+    def test_suite_result_red_run_envelope_ok_marker_incomplete(self):
+        # File present but the suite red: the READ succeeded (ok True);
+        # consumers gate on marker, which is INCOMPLETE (unchanged suite_marker).
+        path = self._write(self._tmpdir(), "suite.json",
+                           json.dumps({"ok": True, "fail": 2, "total": 5}))
+        res = self.client.suite_result(path)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["marker"], "INCOMPLETE")
+
+    # -- error envelopes (no bare tracebacks) --------------------------------
+    def test_suite_result_missing_file_contract_error(self):
+        missing = os.path.join(self._tmpdir(), "absent.json")
+        res = self.client.suite_result(missing)
+        self.assertFalse(res["ok"])
+        self.assertIn("state", res)
+        err = res["error"]
+        self.assertEqual(err["reason"], "suite_result_missing")
+        for key in ("code", "message", "reason", "suggested"):
+            self.assertIn(key, err)
+        self.assertTrue(err["suggested"], "missing-file error must carry next steps")
+        self.assertIn(missing, err["message"], "message names the resolved path")
+
+    def test_suite_result_malformed_json_contract_error(self):
+        # A corrupt/partial result file must surface as a contract envelope,
+        # never a json.JSONDecodeError traceback.
+        path = self._write(self._tmpdir(), "suite.json", "{not json")
+        res = self.client.suite_result(path)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["reason"], "suite_result_unreadable")
+
+    # -- path forms ----------------------------------------------------------
+    def test_suite_result_relative_and_res_scheme_anchor_project_root(self):
+        import shutil
+        import tempfile
+        root = tempfile.mkdtemp()
+        self._dirs.append(root)
+        os.makedirs(os.path.join(root, "out"))
+        self._write(os.path.join(root, "out"), "suite.json",
+                    json.dumps({"ok": True, "fail": 0}))
+        with mock.patch.object(ebc, "PROJECT_ROOT", root):
+            rel = self.client.suite_result(os.path.join("out", "suite.json"))
+            res_scheme = self.client.suite_result("res://out/suite.json")
+        self.assertTrue(rel["ok"], "project-relative path must resolve")
+        self.assertTrue(res_scheme["ok"], "res://-adjacent form must resolve")
+
+    def test_suite_result_user_scheme_reads_mapped_app_userdata(self):
+        import shutil
+        import tempfile
+        root = tempfile.mkdtemp()   # fake project root (project-name read)
+        home = tempfile.mkdtemp()   # fake home — real ~/.local never touched
+        self._dirs.extend([root, home])
+        self._write(root, "project.godot", 'config_version=5\nconfig/name="FakeProj"\n')
+        appdata = os.path.join(_app_userdata_base(home), "FakeProj")
+        os.makedirs(appdata)
+        self._write(appdata, "suite.json",
+                    json.dumps({"ok": True, "fail": 0, "total": 7}))
+        with mock.patch.object(ebc, "PROJECT_ROOT", root), \
+             mock.patch("os.path.expanduser", side_effect=_fake_home(home)):
+            res = self.client.suite_result("user://suite.json")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["result"]["total"], 7)
+        self.assertEqual(res["marker"], "TRUSTWORTHY")
 
 
 class TestDapAutoAttach(unittest.TestCase):
