@@ -33,6 +33,7 @@ import glob
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -51,6 +52,10 @@ LAUNCH_MARKER_PREFIX = "=== EditorBridge launch"
 
 DEFAULT_TIMEOUT = 30.0
 LIVE_WINDOW_S = 2.0      # heartbeat younger than this = editor alive
+
+# Test seam for the launch version probe: set to a runner(cmd)->str callable
+# to keep unit tests from spawning processes (None = real subprocess).
+VERSION_RUNNER = None
 LAUNCH_DEADLINE_S = 300.0  # first run after an engine upgrade reimports everything
 OUTBOX_PURGE_AGE_S = 120.0  # outbox files older than this are pruned on CLI start
 BINARY_CONFIG = os.path.join(PROJECT_ROOT, ".godot-editor-path")
@@ -89,6 +94,22 @@ class EditorBridgeError(Exception):
 
 class EditorBridgeNotRunning(Exception):
     """Raised when the editor has no fresh heartbeat."""
+
+
+class _BridgeArgParser(argparse.ArgumentParser):
+    """ArgumentParser with the guaranteed error surface (Task 15).
+
+    Every argparse usage error (unknown command, missing required argument,
+    invalid choice — subparser errors inherit this class via `type(self)`)
+    prints usage + `Error [bad_args]:` + a `suggested:` line, exit code 2.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print("Error [bad_args]: %s" % message, file=sys.stderr)
+        print("  suggested: run the same command with --help to see its "
+              "exact arguments", file=sys.stderr)
+        sys.exit(2)
 
 
 def _find_godot_binary():
@@ -209,21 +230,22 @@ def _launch_preflight(project_path: str = None, force: bool = False) -> None:
     procs = cli_proc.find_godot_procs(proj)
     if cli_proc.launch_should_refuse(procs, force):
         pids = ", ".join(str(p) for p, _ in procs["editors"])
-        print("Error: Godot editor already running on this project (pid(s): %s)." % pids,
-              file=sys.stderr)
-        print("A second editor corrupts the shared bridge mailbox. Quit it first "
-              "(or kill the pid), then retry. Set EDITOR_BRIDGE_ALLOW_MULTI=1 to "
-              "override.", file=sys.stderr)
+        print("Error [editor_running]: Godot editor already running on this "
+              "project (pid(s): %s)." % pids, file=sys.stderr)
+        print("A second editor corrupts the shared bridge mailbox. Quit it "
+              "first (or kill the pid), then retry.", file=sys.stderr)
+        print("  suggested: close the other editor (or kill the pid), then "
+              "relaunch", file=sys.stderr)
+        print("  suggested: `launch --force` kills the lingering editor and "
+              "orphans before relaunching", file=sys.stderr)
+        print("  suggested: EDITOR_BRIDGE_ALLOW_MULTI=1 overrides this "
+              "refusal (not recommended)", file=sys.stderr)
         sys.exit(1)
     if force and procs["editors"]:
         # S6: a lingering editor is force-killed so `launch --force` never spawns
         # a second editor (which would corrupt the shared bridge mailbox).
-        import signal as _sig
         for pid, _ in procs["editors"]:
-            try:
-                os.kill(pid, _sig.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            cli_proc.kill_pid(pid)
         for _ in range(20):
             if all(not cli_proc.pid_alive(p) for p, _ in procs["editors"]):
                 break
@@ -231,12 +253,8 @@ def _launch_preflight(project_path: str = None, force: bool = False) -> None:
         print("Killed lingering editor(s): %s" % [p for p, _ in procs["editors"]],
               file=sys.stderr)
     if cli_proc.should_kill_orphans(procs, force):
-        import signal as _sig
         for pid, _ in procs["games"]:
-            try:
-                os.kill(pid, _sig.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            cli_proc.kill_pid(pid)
         print("Killed orphan game(s): %s" % [p for p, _ in procs["games"]],
               file=sys.stderr)
     elif procs["games"]:
@@ -261,11 +279,18 @@ def _resolved_path(args) -> str:
     pos = getattr(args, "path_pos", None)
     flag = getattr(args, "path", None)
     if pos and flag and pos != flag:
-        raise SystemExit("path given twice (positional vs --path): %r vs %r"
-                         % (pos, flag))
+        raise EditorBridgeError(
+            "path given twice (positional vs --path): %r vs %r" % (pos, flag),
+            reason="bad_args",
+            suggested=["pass the path ONE way — positional or --path, not "
+                       "both (they must also match)"])
     resolved = pos or flag or ""
     if not resolved:
-        raise SystemExit("a scene path is required (positional or --path)")
+        raise EditorBridgeError(
+            "a scene path is required (positional or --path)",
+            reason="bad_args",
+            suggested=["e.g. `action scene-open res://scenes/main.tscn` or "
+                       "`action scene-open --path res://scenes/main.tscn`"])
     return resolved
 
 
@@ -276,9 +301,18 @@ def _parse_json_params(raw: str) -> dict:
     try:
         val = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"--json-params is not valid JSON: {e}")
+        raise EditorBridgeError(
+            "--json-params is not valid JSON: %s" % e,
+            reason="bad_args",
+            suggested=[
+                "pass a JSON object, e.g. --json-params '{\"key\": \"value\"}'",
+                "omitted or empty means no parameters",
+            ])
     if not isinstance(val, dict):
-        raise SystemExit("--json-params must be a JSON object ({...})")
+        raise EditorBridgeError(
+            "--json-params must be a JSON object ({...})",
+            reason="bad_args",
+            suggested=["wrap the parameters in { } keyed by parameter name"])
     return val
 
 
@@ -455,14 +489,36 @@ class EditorBridgeClient:
         proj = project_path or PROJECT_ROOT
         path_err = cli_proc.validate_project_path(proj)
         if path_err:
-            print("Error: %s" % path_err, file=sys.stderr)
-            sys.exit(1)
+            raise EditorBridgeError(path_err, reason="bad_project",
+                                    suggested=[
+                                        "run the CLI from inside your Godot "
+                                        "project root (the directory with "
+                                        "project.godot)",
+                                        "run `doctor` for a full setup "
+                                        "diagnosis",
+                                    ])
         binary = _find_godot_binary()
         if not binary:
-            print("Error: Godot binary not found.", file=sys.stderr)
-            print("Set GODOT_EDITOR_BINARY env var, write the binary path to %s,"
-                  " or install Godot 4.x." % BINARY_CONFIG, file=sys.stderr)
-            sys.exit(1)
+            raise EditorBridgeError(
+                "Godot binary not found",
+                reason="godot_binary",
+                suggested=[
+                    "set the GODOT_EDITOR_BINARY env var to your Godot "
+                    "binary path",
+                    "or write the binary path to %s in the project root"
+                    % BINARY_CONFIG,
+                    "or install Godot 4.8+ and put it on PATH (see "
+                    "CONTRIBUTING dev setup)",
+                ])
+
+        # Version gate: refuse engines below the supported floor BEFORE
+        # spawning (a 3.x/old-4.x editor silently mis-behaves in ways an
+        # agent cannot debug). VERSION_RUNNER is the test seam.
+        gate = cli_proc.launch_version_gate(
+            cli_proc.version_probe_text(binary, runner=VERSION_RUNNER))
+        if gate:
+            raise EditorBridgeError(gate["message"], reason=gate["reason"],
+                                    suggested=gate["suggested"])
 
         cmd = [binary, "--editor", "--path", proj]
         print("Launching: %s --editor --path %s" % (binary, rel(proj)), file=sys.stderr)
@@ -472,14 +528,13 @@ class EditorBridgeClient:
         kwargs = dict(stdout=log_file, stderr=subprocess.STDOUT,
                       stdin=subprocess.DEVNULL,
                       close_fds=True)
-        # A1: detach so Ctrl-C / the CLI parent's death won't take the editor
-        # with it. `start_new_session` is a Popen kwarg (setsid on POSIX), NOT a
-        # `subprocess` module attribute — the old `hasattr(subprocess,
-        # "start_new_session")` guard was ALWAYS False, so the detach silently
-        # never applied. On Windows the kwarg raises ValueError, so guard on the
-        # platform (this project is Linux-only in practice).
-        if os.name == "posix":
-            kwargs["start_new_session"] = True
+        # A1: detach so Ctrl-C / console close / the CLI parent's death
+        # won't take the editor down with unsaved edits. Platform decision
+        # lives in cli_proc.spawn_detach_kwargs (unit-pinned both branches):
+        # setsid on posix; DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP on
+        # Windows (stdio is already redirected to the log file above, which
+        # DETACHED_PROCESS requires).
+        kwargs.update(cli_proc.spawn_detach_kwargs(os.name))
         proc = subprocess.Popen(cmd, **kwargs)
         try:
             log_file.write(("\n%s %s (editor pid %d) ===\n"
@@ -493,9 +548,14 @@ class EditorBridgeClient:
         deadline = time.time() + LAUNCH_DEADLINE_S
         while time.time() < deadline:
             if proc.poll() is not None:
-                print("Error: editor process exited early (code %s)" % proc.returncode,
-                      file=sys.stderr)
+                print("Error [launch_failed]: editor process exited early "
+                      "(code %s)" % proc.returncode, file=sys.stderr)
                 self._print_console_tail(15)
+                print("  suggested: read the console tail above (a parse "
+                      "error in a plugin/script is the usual cause)",
+                      file=sys.stderr)
+                print("  suggested: run `doctor`, then `launch` again",
+                      file=sys.stderr)
                 sys.exit(1)
             state = self.read_state()
             if state and state.get("alive"):
@@ -505,7 +565,11 @@ class EditorBridgeClient:
                 return state
             time.sleep(0.5)
 
-        print("Error: editor did not become ready within %.0fs" % LAUNCH_DEADLINE_S,
+        print("Error [launch_failed]: editor did not become ready within "
+              "%.0fs" % LAUNCH_DEADLINE_S, file=sys.stderr)
+        print("  suggested: check .tmp/logs/ (first import after an engine "
+              "upgrade can exceed the deadline — retry once)", file=sys.stderr)
+        print("  suggested: run `doctor`, then `launch` again",
               file=sys.stderr)
         # A1: a timed-out launch must not leave the spawned editor running.
         try:
@@ -597,11 +661,7 @@ class EditorBridgeClient:
                 if editor_pid and cli_proc.pid_alive(editor_pid):
                     print("Editor (pid %d) still alive 45s after the quit request — "
                           "force-killing it." % editor_pid, file=sys.stderr)
-                    import signal as _sig
-                    try:
-                        os.kill(editor_pid, _sig.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                    cli_proc.kill_pid(editor_pid)
                     for _ in range(20):
                         if not cli_proc.pid_alive(editor_pid):
                             break
@@ -656,11 +716,7 @@ class EditorBridgeClient:
                 orphan_pid = procs["games"][0][0]
         plan = cli_proc.recover_plan(editor_alive, running, bridge_up, breaked, orphan_pid)
         if plan["action"] == "kill_orphan":
-            import signal as _sig
-            try:
-                os.kill(plan["orphan_pid"], _sig.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            cli_proc.kill_pid(plan["orphan_pid"])
             plan["killed_pid"] = plan["orphan_pid"]
         elif plan["action"] == "replay_scene":
             self.rpc("action.scene.stop", {}, timeout=10)
@@ -823,7 +879,13 @@ def _print_game_unreachable(err: "EditorBridgeError") -> None:
     A single racy state.json read can't derail the report: we retry the read.
     Any auto-investigation step that fails degrades gracefully to the manual tips.
     """
-    print("Error: %s" % err, file=sys.stderr)
+    cls = cli_proc.error_class(err.reason if isinstance(err, EditorBridgeError) else "",
+                               getattr(err, "code", ""))
+    print("Error [%s]: %s" % (cls, err), file=sys.stderr)
+    for s in (getattr(err, "suggested", None) or
+              ["run `query godot-status` to see editor/game state",
+               "run `recover` once"]):
+        print("  suggested: %s" % s, file=sys.stderr)
     state = {}
     client = None
     try:
@@ -893,7 +955,10 @@ def _handle_game_error(err: "EditorBridgeError") -> None:
     else:
         # Logic error: the editor answered cleanly; the in-game bridge was never
         # touched. Show the editor's message as-is (no unreachable block).
-        print("Error: %s" % err, file=sys.stderr)
+        cls = cli_proc.error_class(err.reason, err.code)
+        print("Error [%s]: %s" % (cls, err), file=sys.stderr)
+        for s in err.suggested:
+            print("  suggested: %s" % s, file=sys.stderr)
     # Legibility contract to STDOUT (machine-readable); the human-readable
     # investigation above stays on stderr. reason is the actionable signal
     # (spec §6) — the LLM acts on reason+suggested, not a timeout.
@@ -1096,7 +1161,7 @@ RETRYABLE_GAME_COMMANDS = {
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Editor Bridge CLI for Godot (file mailbox)")
+    parser = _BridgeArgParser(description="Editor Bridge CLI for Godot (file mailbox)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     parser_launch = subparsers.add_parser("launch", help="Start the editor and wait for it")
@@ -1111,6 +1176,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="One-shot self-heal: relaunch editor / kill orphan / replay scene / "
              "continue a breaked game — report a single status")
     subparsers.add_parser("ping", help="Check editor liveness (heartbeat)")
+    parser_doc = subparsers.add_parser(
+        "doctor",
+        help="Setup health check: install, registration, Godot binary, "
+             "editor liveness — with actionable fixes (works with no editor running)")
+    parser_doc.add_argument("--path", default=".",
+                            help="project directory to check (default: cwd)")
+    parser_doc.add_argument("--json", dest="as_json", action="store_true",
+                            help="machine-readable {ok, checks} output")
     subparsers.add_parser("connect", help="Verify the editor is reachable, print state")
 
     q = subparsers.add_parser("query")
@@ -1404,6 +1477,133 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _doctor_read_project(proj: str):
+    """Static read of <proj>/project.godot.
+
+    Returns (exists, features_version, autoload_lines, plugin_lines).
+    """
+    path = os.path.join(proj, "project.godot")
+    if not os.path.isfile(path):
+        return False, "", [], []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False, "", [], []
+    section = ""
+    features = ""
+    autoload, plugins = [], []
+    for line in lines:
+        s = line.strip()
+        if s.startswith(";"):  # Godot INI comment — a commented-out
+            continue           # registration line is NOT registered
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1]
+            continue
+        if section == "application" and s.startswith("config/features="):
+            m = re.search(r"(\d+\.\d+)", s)
+            if m:
+                features = m.group(1)
+        elif section == "autoload":
+            autoload.append(line)
+        elif section == "editor_plugins":
+            plugins.append(line)
+    return True, features, autoload, plugins
+
+
+def _doctor_heartbeat_age(proj: str):
+    """Editor heartbeat age in seconds for <proj> (None if no state.json)."""
+    try:
+        with open(os.path.join(proj, ".tmp", "bridge", "state.json")) as f:
+            data = json.load(f)
+        return max(time.time() - data.get("heartbeat_ms", 0) / 1000.0, 0.0)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _doctor_godot_version(proj: str):
+    """Version string of the discoverable Godot binary for <proj>, or None.
+
+    Discovery order matches _find_godot_binary (env → per-project
+    .godot-editor-path → PATH), but reads the TARGET project's config file,
+    not the CLI install's.
+    """
+    binp = None
+    env = os.environ.get("GODOT_EDITOR_BINARY")
+    if env and os.path.exists(env):
+        binp = env
+    if binp is None:
+        try:
+            with open(os.path.join(proj, ".godot-editor-path")) as f:
+                cfg = f.read().strip().strip('"').strip("'")
+            if cfg:
+                cfg = cfg if os.path.isabs(cfg) else os.path.join(proj, cfg)
+                if os.path.exists(cfg):
+                    binp = cfg
+        except OSError:
+            pass
+    if binp is None:
+        import shutil
+        for name in ("godot", "godot4", "Godot", "godot-editor"):
+            found = shutil.which(name)
+            if found:
+                binp = found
+                break
+    if binp is None:
+        # Fall back to the launcher's full discovery (registry on Windows,
+        # common install locations) so doctor never claims a hard miss for a
+        # binary `launch` would actually find. Silence its advisory prints —
+        # doctor output is check lines only.
+        _out, _err = sys.stdout, sys.stderr
+        try:
+            import io
+            sys.stdout = sys.stderr = io.StringIO()
+            binp = _find_godot_binary()
+        finally:
+            sys.stdout, sys.stderr = _out, _err
+    if binp is None:
+        return None
+    try:
+        out = subprocess.run([binp, "--version"], capture_output=True,
+                             text=True, timeout=15)
+        lines = (out.stdout or "").strip().splitlines()
+        return lines[-1] if lines else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def run_doctor(project_path: str, as_json: bool) -> int:
+    """`doctor`: static setup diagnosis. Exit 0 iff no check failed."""
+    proj = os.path.abspath(project_path)
+    exists, features, autoload, plugins = _doctor_read_project(proj)
+    checks = cli_proc.doctor_evaluate(
+        project_exists=exists,
+        features=features,
+        autoload_lines=autoload,
+        plugin_lines=plugins,
+        python_version=tuple(sys.version_info[:2]),
+        godot_version_out=_doctor_godot_version(proj),
+        heartbeat_age_s=_doctor_heartbeat_age(proj),
+        heartbeat_stale_s=LIVE_WINDOW_S,
+        os_name=platform.system(),
+    )
+    ok = not any(c["status"] == "fail" for c in checks)
+    if as_json:
+        print(json.dumps({"ok": ok, "checks": checks}, indent=2))
+    else:
+        icon = {"ok": "[ok]  ", "warn": "[warn]", "fail": "[FAIL]"}
+        print("doctor: %s  (%s)"
+              % ("healthy" if ok else "problems found", proj))
+        for c in checks:
+            print("%s %-22s %s" % (icon[c["status"]], c["name"], c["detail"]))
+            if c["fix"] and c["status"] != "ok":
+                print("        fix: %s" % c["fix"])
+        if not ok:
+            print("\nFix the [FAIL] items above; [warn] items are "
+                  "informational. Re-run doctor to confirm.")
+    return 0 if ok else 1
+
+
 def main() -> None:
     args = build_parser().parse_args()
     # `logs` with no subcommand word defaults to "get" (fetch). An optional
@@ -1411,10 +1611,21 @@ def main() -> None:
     # dispatch block below simple (dogfood BD-014).
     if args.command == "logs" and args.log_type is None:
         args.log_type = "get"
-    client = EditorBridgeClient()
-    _GLOBAL_CLIENT = client
-
+    if args.command == "doctor":
+        # Static diagnosis by design: runs with no editor, no mailbox I/O.
+        try:
+            sys.exit(run_doctor(args.path, args.as_json))
+        except Exception as e:  # never dump a raw traceback from doctor
+            print("doctor error: %s (report this with --path value)" % e,
+                  file=sys.stderr)
+            sys.exit(2)
     try:
+        # Client creation touches the filesystem (mailbox dirs) — inside the
+        # guard so a broken project layout yields a classed error, not a
+        # traceback (Task 15 guarantee).
+        client = EditorBridgeClient()
+        _GLOBAL_CLIENT = client
+
         if args.command == "launch":
             state = client.launch(force=args.force)
             print(json.dumps(state, indent=2))
@@ -1501,8 +1712,14 @@ def main() -> None:
             if args.action_type == "scene-open":
                 path = _resolved_path(args)
                 if path in state.get("scenes", {}).get("open", []):
-                    print("Scene already open: %s" % path, file=sys.stderr)
-                    sys.exit(1)
+                    raise EditorBridgeError(
+                        "already open: %s" % path,
+                        reason="scene_already_open",
+                        suggested=[
+                            "close it first: `action scene-close --path %s`"
+                            % path,
+                            "or use the open instance (see `query state`)",
+                        ])
                 result = client.rpc("action.scene.open", {"path": path})
             elif args.action_type == "scene-close":
                 result = client.rpc("action.scene.close", {"path": args.path})
@@ -1512,10 +1729,15 @@ def main() -> None:
                 result = client.rpc("action.scene.save_all", {})
             elif args.action_type == "scene-play":
                 if state.get("game", {}).get("running"):
-                    print("Error: game already playing %s"
-                          % state["game"].get("playing_scene"), file=sys.stderr)
-                    print("Run: editor_bridge_cli.py action scene-stop", file=sys.stderr)
-                    sys.exit(1)
+                    raise EditorBridgeError(
+                        "game already playing %s"
+                        % state["game"].get("playing_scene"),
+                        reason="game_playing",
+                        suggested=[
+                            "stop it first: `action scene-stop`",
+                            "or inspect the running game instead: "
+                            "`game scene-info`",
+                        ])
                 result = client.rpc("action.scene.play", {"path": args.path or ""})
             elif args.action_type == "scene-stop":
                 result = client.rpc("action.scene.stop", {})
@@ -1724,7 +1946,14 @@ def main() -> None:
                         alive = True
                     except (EditorBridgeError, EditorBridgeNotRunning):
                         pass
-                    print(cli_proc.dap_timeout_message(alive), file=sys.stderr)
+                    print("Error [dap_timeout]: %s"
+                          % cli_proc.dap_timeout_message(alive),
+                          file=sys.stderr)
+                    print("  suggested: run `debugger state` — a PAUSED game "
+                          "blocks DAP requests; `debugger continue` resumes",
+                          file=sys.stderr)
+                    print("  suggested: `recover` once if editor or game is "
+                          "wedged", file=sys.stderr)
                     sys.exit(1)
                 raise
             print(json.dumps(_contract_ok(result, _current_state()), indent=2))
@@ -1761,15 +1990,32 @@ def main() -> None:
             print(json.dumps(client.suite_result(args.path), indent=2))
 
     except EditorBridgeNotRunning as e:
-        print("Error: %s" % e, file=sys.stderr)
-        print("Start it with: python3 bridge/cli/editor_bridge_cli.py launch",
+        cls = cli_proc.error_class("editor_not_running")
+        print("Error [%s]: %s" % (cls, e), file=sys.stderr)
+        print("  suggested: start the editor with `... editor_bridge_cli.py "
+              "launch`, then `ping` to confirm the heartbeat",
               file=sys.stderr)
+        print("  suggested: if an editor is already open but stale, run "
+              "`recover` once", file=sys.stderr)
         sys.exit(2)
     except EditorBridgeError as e:
         cls = cli_proc.error_class(e.reason, e.code)
         print("Error [%s]: %s" % (cls, e), file=sys.stderr)
         for s in e.suggested:
             print("  suggested: %s" % s, file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:  # the guarantee: never a bare traceback (Task 15)
+        cls = cli_proc.error_class("unexpected")
+        print("Error [%s]: %s: %s" % (cls, type(e).__name__, e),
+              file=sys.stderr)
+        print("  suggested: re-run the same command (a one-off failure may "
+              "not repeat); include its exact text in the report",
+              file=sys.stderr)
+        print("  suggested: run `doctor` to check the setup",
+              file=sys.stderr)
+        print("  suggested: if it repeats, report it at "
+              "https://github.com/imrooniel/Godot-LLM-Bridge/issues with the "
+              "command + outputs", file=sys.stderr)
         sys.exit(1)
 
 

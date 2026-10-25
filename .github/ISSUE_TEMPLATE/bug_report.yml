@@ -1,0 +1,78 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing! Before submitting, run the health check and the
+        search — many issues are environment setup:
+        ```bash
+        python3 bridge/cli/editor_bridge_cli.py doctor
+        ```
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Clear description of the failure, including the exact CLI command you ran and its full output.
+      placeholder: |
+        `python3 bridge/cli/editor_bridge_cli.py launch` exits 3 with
+        `EDITOR_NOT_FOUND` even though Godot is in PATH.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output
+      description: Paste of `python3 bridge/cli/editor_bridge_cli.py doctor` (redacts nothing, but check for secrets).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1. Fresh project with ...
+        2. Run ...
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS + version
+      description: e.g. Windows 11 23H2, Fedora 44, Ubuntu 24.04
+      placeholder: Fedora 44
+    validations:
+      required: true
+  - type: input
+    id: godot
+    attributes:
+      label: Godot version
+      description: Exact version string (run `godot --version`), and whether it is stable/custom-built.
+      placeholder: 4.7.2.stable.official
+    validations:
+      required: true
+  - type: input
+    id: bridge-version
+    attributes:
+      label: Bridge version
+      description: Release tag or commit you installed (see the `VERSION` file in `bridge/`'s repo root).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Tail of `.tmp/logs/` and any engine error output. Optional but very helpful.
+      render: shell
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I read the README install section and ran `doctor` (output above)
+          required: true
+        - label: I searched existing issues (open and closed) for duplicates
+          required: true

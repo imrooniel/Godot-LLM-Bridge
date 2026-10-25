@@ -145,16 +145,37 @@ func _initialize() -> void:
 	bridge.queue_free()
 	await process_frame  # let the bridge (and its TCP listener) be freed
 
-	# B4: with no game/bridge listening, is_reachable() must return false cleanly
-	# (it will attempt a connect to 127.0.0.1:5555 and fail). Use the proxy, not
-	# the bridge (the proxy is the editor-side client). This check runs AFTER the
-	# test debug_bridge is freed on purpose: that instance also listens on
-	# 127.0.0.1:5555 (its _ready() opens the server in debug builds) and would
-	# answer the probe, making "no server" false.
+	# B4: with nothing listening, is_reachable() must return false cleanly
+	# AND fast. DIAL AN ISOLATED HIGH PORT instead of 5555: the project's
+	# DebugBridge AUTOLOAD is present in every run — including headless
+	# --script — and holds 5555 open, so "no server on 5555" is not a
+	# condition this test process can create (CI failed the original check
+	# deterministically, 20/20 tries; the pre-2026-10-25 'passing' was the
+	# editor-side run, a different process). A closed loopback port answers
+	# RST immediately, so the false verdict must not cost a second. If the
+	# isolated port itself is occupied (foreign game on a dev box can land
+	# there), the check degrades to an honest skip, never a false green.
 	var proxy = load("res://bridge/editor_bridge/game_proxy.gd").new()
-	await process_frame
-	_check("game_proxy.is_reachable() false with no server", proxy.is_reachable() == false)
+	var isolated_port := 59599  # IANA unassigned; foreign-server-safe (skip)
+	var pre = StreamPeerTCP.new()
+	var pre_err := pre.connect_to_host("127.0.0.1", isolated_port)
+	pre.poll()
+	var pre_connected := pre_err == Error.OK and \
+			pre.get_status() == StreamPeerTCP.STATUS_CONNECTED
+	pre.disconnect_from_host()
+	if pre_connected:
+		print("  SKIP: is_reachable-no-server (" + str(isolated_port)
+				+ " is occupied by a foreign server on this host)")
+	else:
+		proxy.discovered_port = isolated_port
+		var t0 := Time.get_ticks_msec()
+		var r: bool = proxy.is_reachable()
+		var ms := Time.get_ticks_msec() - t0
+		var lbl: String = "game_proxy.is_reachable() false with no server"
+		lbl = lbl + " (isolated port " + str(isolated_port) + ", " + str(ms) + " ms)"
+		_check(lbl, not r)
 	proxy.reset()
+	proxy.discovered_port = 5555
 
 	print("")
 	print("=== Bridge Test Results ===")

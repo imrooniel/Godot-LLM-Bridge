@@ -1,6 +1,6 @@
 ---
 name: editor-bridge
-description: Use when driving the Godot editor from the terminal — launching the editor, opening/saving/playing/stopping scenes, querying editor state or the scene tree, reading editor logs, subscribing to events, or debugging via DAP. Trigger keywords: EditorBridge, editor_bridge_cli.py, launch, restart, recover, ping, query state, scene-open, scene-play, scene-stop, scene-save, fs-scan, clear-breakpoints, debugger, subscribe, "Godot editor", file-mailbox bridge, editor bridge.
+description: Use when driving the Godot editor from the terminal — launching the editor, opening/saving/playing/stopping scenes, querying editor state or the scene tree, reading editor logs, subscribing to events, or debugging via DAP. Trigger keywords: EditorBridge, editor_bridge_cli.py, launch, restart, recover, doctor, ping, query state, scene-open, scene-play, scene-stop, scene-save, fs-scan, clear-breakpoints, debugger, subscribe, "Godot editor", file-mailbox bridge, editor bridge.
 ---
 
 # Agent Skill: EditorBridge
@@ -52,6 +52,7 @@ inspection tool — the authoritative table."** The editor-side (non-game) chann
 | evaluate ONE editor expression | `action eval "<expr>"` | single expression; policy-checked |
 | read the human's edits since last turn | `query human-deltas [--since <turn>]` | content deltas (turn handoff) |
 | something wedged | `recover` | relaunch editor / kill orphan / replay scene / continue a breaked game |
+| is the SETUP right (install/diagnosis)? | `doctor [--path DIR] [--json]` | static checks: project file, Godot feature floor (4.8 required), Python, binary discovery, autoload+plugin registration, heartbeat, OS; one `fix:` per FAIL; exit 0 iff no FAIL; works with no editor running — run it FIRST when a stranger's bridge misbehaves |
 
 ## Editing bridge commands without restarting the editor
 
@@ -66,6 +67,8 @@ Binary detection order: `GODOT_EDITOR_BINARY` env → project-local `.godot-edit
 # Startup can take a while (first import after an engine upgrade reimports
 # everything); launch waits up to 300 s — give the call a tool timeout > 300000 ms.
 python3 bridge/cli/editor_bridge_cli.py launch
+# launch gates the engine version (Error [godot_version] = below the supported
+# floor — repin the binary per doctor/CONTRIBUTING; relaunching won't help).
 
 # Reliable restart: stop game + quit + wait for the PID to die + launch.
 # ('action editor-restart' is the ENGINE's restart = quit + best-effort spawn
@@ -76,6 +79,10 @@ python3 bridge/cli/editor_bridge_cli.py restart
 # single status. Precedence: editor down > orphan game > game-up-but-bridge-down
 # > breaked (paused) game > ok.
 python3 bridge/cli/editor_bridge_cli.py recover
+
+# Setup diagnosis (no editor needed): install, registration, binary,
+# heartbeat, OS — actionable fix per FAIL, --json for machines.
+python3 bridge/cli/editor_bridge_cli.py doctor
 
 # Liveness check (heartbeat freshness, no round trip)
 python3 bridge/cli/editor_bridge_cli.py ping

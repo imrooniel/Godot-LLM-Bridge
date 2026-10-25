@@ -46,23 +46,23 @@ PS_TRUNCATED = (
 
 class TestProcMatching(unittest.TestCase):
     def test_editor_and_game_split(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR, os_name="posix")
         self.assertEqual([p for p, _ in r["editors"]], [101])
         self.assertEqual([p for p, _ in r["games"]], [102])
 
     def test_other_project_ignored(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ, os_name="posix")
         self.assertEqual(r["editors"], [])
         self.assertEqual(r["games"], [])
 
     def test_game_only_not_editor(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY, os_name="posix")
         self.assertEqual(r["editors"], [])
         self.assertEqual([p for p, _ in r["games"]], [301])
 
     def test_truncated_path_not_matched(self):
         # A2(b): a truncated --path must NOT be treated as this project.
-        r = cp.find_godot_procs(PROJ, ps_out=PS_TRUNCATED)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_TRUNCATED, os_name="posix")
         self.assertEqual(r["editors"], [])
 
     def test_percent20_normalized(self):
@@ -110,7 +110,7 @@ class TestLaunchPreflight(unittest.TestCase):
     def _preflight(self, ps_out, project=PROJ):
         # Mirror the exact decision the CLI makes (imported after Task 1 wires
         # it in; until then this asserts against the helper contract).
-        r = cp.find_godot_procs(project, ps_out=ps_out)
+        r = cp.find_godot_procs(project, ps_out=ps_out, os_name="posix")
         return r
 
     def test_refuse_when_editor_running(self):
@@ -236,24 +236,24 @@ class TestRestartForce(unittest.TestCase):
     def test_preflight_suppressed_when_force(self):
         # With force=True, a running editor must NOT block (restart already
         # quit it; a lingering pid is force-killed, not a reason to refuse).
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR, os_name="posix")
         self.assertTrue(cp.launch_should_refuse(r, force=True) is False)
     def test_preflight_refuses_when_not_force(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR, os_name="posix")
         self.assertTrue(cp.launch_should_refuse(r, force=False) is True)
 
 
 class TestOrphanKill(unittest.TestCase):
     def test_orphan_kill_flag(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY, os_name="posix")
         self.assertTrue(cp.should_kill_orphans(r, force=True))
     def test_orphan_not_killed_without_force(self):
-        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_GAME_ONLY, os_name="posix")
         self.assertFalse(cp.should_kill_orphans(r, force=False))
     def test_no_kill_when_no_games(self):
         # The bool(procs["games"]) half of the `and`: force alone is not enough
         # when there is no orphan game to kill.
-        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ)
+        r = cp.find_godot_procs(PROJ, ps_out=PS_EDITOR_OTHER_PROJ, os_name="posix")
         self.assertFalse(cp.should_kill_orphans(r, force=True))
 
 
@@ -527,6 +527,523 @@ class TestRpcParamsAlias(unittest.TestCase):
         p = ebc.build_parser()
         args = p.parse_args(["game", "rpc", "query_game_state", "--json-params", '{"x": 3}'])
         self.assertEqual(args.json_params, '{"x": 3}')
+
+
+class TestDoctorEvaluate(unittest.TestCase):
+    """doctor_evaluate: pure setup diagnosis (no live editor needed)."""
+
+    def _checks(self, **over):
+        base = dict(
+            project_exists=True,
+            features="4.8",
+            autoload_lines=['DebugBridge="*res://bridge/autoloads/debug_bridge.gd"'],
+            plugin_lines=['enabled=PackedStringArray("res://bridge/editor_bridge/plugin.cfg", "res://bridge/human_edit/plugin.cfg")'],
+            python_version=(3, 11),
+            godot_version_out="4.8.dev.custom_build.34d06658a",
+            heartbeat_age_s=0.3,
+            os_name="Linux",
+        )
+        base.update(over)
+        return cp.doctor_evaluate(**base)
+
+    def _by_name(self, checks, name):
+        for c in checks:
+            if c["name"] == name:
+                return c
+        return None
+
+    def test_healthy_fixture_all_ok(self):
+        checks = self._checks()
+        self.assertTrue(checks)
+        for c in checks:
+            self.assertEqual(c["status"], "ok", "%s: %s" % (c["name"], c["detail"]))
+
+    def test_missing_project_fails_with_root_fix(self):
+        checks = self._checks(project_exists=False)
+        c = self._by_name(checks, "project_godot")
+        self.assertIsNotNone(c)
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("project root", c["fix"])
+
+    def test_feature_below_floor_fails(self):
+        c = self._by_name(self._checks(features="4.6"), "godot_features")
+        self.assertEqual(c["status"], "fail")
+        self.assertEqual(c["name"], "godot_features")
+        self.assertIn("4.8", c["detail"] + c["fix"])
+
+    def test_feature_4_7_fails_owner_ruling(self):
+        # Owner ruling (2026-10-25): the bridge requires Godot 4.8 — the
+        # old 4.7-warn band is revoked; 4.7 is a hard FAIL.
+        c = self._by_name(self._checks(features="4.7"), "godot_features")
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("4.8", c["detail"] + c["fix"])
+
+    def test_feature_4_8_plus_ok(self):
+        for f in ("4.8", "4.9", "5.0"):
+            c = self._by_name(self._checks(features=f), "godot_features")
+            self.assertEqual(c["status"], "ok", f)
+
+    def test_missing_autoload_line_fails_with_exact_fix(self):
+        c = self._by_name(self._checks(autoload_lines=[]), "autoload_debug_bridge")
+        self.assertEqual(c["status"], "fail")
+        self.assertIn('DebugBridge="*res://bridge/autoloads/debug_bridge.gd"', c["fix"])
+
+    def test_missing_plugin_lines_fails_with_exact_fix(self):
+        c = self._by_name(self._checks(plugin_lines=[]), "editor_plugins")
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("res://bridge/editor_bridge/plugin.cfg", c["fix"])
+        self.assertIn("res://bridge/human_edit/plugin.cfg", c["fix"])
+
+    def test_partial_plugins_still_fail(self):
+        lines = ['enabled=PackedStringArray("res://bridge/editor_bridge/plugin.cfg")']
+        c = self._by_name(self._checks(plugin_lines=lines), "editor_plugins")
+        self.assertEqual(c["status"], "fail")
+
+    def test_no_godot_binary_fails(self):
+        c = self._by_name(self._checks(godot_version_out=None), "godot_binary")
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("GODOT_EDITOR_BINARY", c["fix"])
+
+    def test_fresh_heartbeat_ok(self):
+        c = self._by_name(self._checks(heartbeat_age_s=0.5), "editor_heartbeat")
+        self.assertEqual(c["status"], "ok")
+
+    def test_stale_heartbeat_warns(self):
+        c = self._by_name(self._checks(heartbeat_age_s=45.0), "editor_heartbeat")
+        self.assertEqual(c["status"], "warn")
+
+    def test_no_heartbeat_warns_not_fails(self):
+        # doctor works without a running editor — warn, with launch as the fix
+        c = self._by_name(self._checks(heartbeat_age_s=None), "editor_heartbeat")
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("launch", c["fix"])
+
+    def test_python_below_3_9_fails(self):
+        c = self._by_name(self._checks(python_version=(3, 8)), "python_version")
+        self.assertEqual(c["status"], "fail")
+
+    def test_macos_warns_unsupported(self):
+        c = self._by_name(self._checks(os_name="Darwin"), "os_support")
+        self.assertEqual(c["status"], "warn")
+
+    def test_check_shape(self):
+        for c in self._checks():
+            self.assertEqual(sorted(c.keys()), ["detail", "fix", "name", "status"])
+            self.assertIn(c["status"], ("ok", "warn", "fail"))
+
+    def test_commented_autoload_is_not_registered(self):
+        # Godot INI comment char: ';DebugBridge=...' means NOT registered.
+        lines = [';DebugBridge="*res://bridge/autoloads/debug_bridge.gd"']
+        c = self._by_name(self._checks(autoload_lines=lines),
+                          "autoload_debug_bridge")
+        self.assertEqual(c["status"], "fail")
+
+    def test_near_name_autoload_is_not_registered(self):
+        c = self._by_name(
+            self._checks(autoload_lines=['MyDebugBridge="*res://x.gd"']),
+            "autoload_debug_bridge")
+        self.assertEqual(c["status"], "fail")
+
+    def test_commented_plugins_are_not_enabled(self):
+        lines = [';enabled=PackedStringArray("res://bridge/editor_bridge/'
+                 'plugin.cfg", "res://bridge/human_edit/plugin.cfg")']
+        c = self._by_name(self._checks(plugin_lines=lines), "editor_plugins")
+        self.assertEqual(c["status"], "fail")
+
+
+class TestDoctorCliWiring(unittest.TestCase):
+    def test_parser_accepts_doctor_flags(self):
+        p = ebc.build_parser()
+        args = p.parse_args(["doctor", "--path", "/tmp/x", "--json"])
+        self.assertEqual(args.command, "doctor")
+        self.assertEqual(args.path, "/tmp/x")
+        self.assertTrue(args.as_json)
+
+    def test_doctor_defaults_path_cwd(self):
+        args = ebc.build_parser().parse_args(["doctor"])
+        self.assertEqual(args.path, ".")
+        self.assertFalse(args.as_json)
+
+    def test_doctor_json_in_empty_dir_exits_1_with_project_fail(self):
+        import json as _json
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            proc = subprocess.run(
+                [sys.executable,
+                 os.path.join(os.path.dirname(__file__), "..", "cli",
+                              "editor_bridge_cli.py"),
+                 "doctor", "--path", tmp, "--json"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            payload = _json.loads(proc.stdout)
+            self.assertFalse(payload["ok"])
+            names = {c["name"]: c for c in payload["checks"]}
+            self.assertEqual(names["project_godot"]["status"], "fail")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestLaunchVersionGate(unittest.TestCase):
+    """launch must refuse Godot below the supported floor. Owner ruling
+    (2026-10-25): 4.8 ONLY — nothing less. CI pins official 4.8-beta1 until
+    4.8-stable ships (same floor, prerelease build)."""
+
+    def test_parse_stable(self):
+        self.assertEqual(cp.parse_godot_version("4.8.stable.official.abc\n"),
+                         (4, 8))
+
+    def test_parse_dev_custom(self):
+        self.assertEqual(cp.parse_godot_version("4.8.dev.custom_build.34d0"),
+                         (4, 8))
+        self.assertEqual(cp.parse_godot_version("4.7.2.stable.official.ed1"),
+                         (4, 7))
+
+    def test_parse_garbage(self):
+        self.assertIsNone(cp.parse_godot_version("not a version"))
+        self.assertIsNone(cp.parse_godot_version(""))
+        self.assertIsNone(cp.parse_godot_version(None))
+
+    def test_supported(self):
+        self.assertTrue(cp.godot_version_supported((4, 8)))
+        self.assertTrue(cp.godot_version_supported((4, 9)))
+        self.assertTrue(cp.godot_version_supported((5, 0)))
+        self.assertFalse(cp.godot_version_supported((4, 6)))
+        self.assertFalse(cp.godot_version_supported((4, 7)))
+        self.assertFalse(cp.godot_version_supported(None))
+
+    def test_gate_passes_supported(self):
+        self.assertIsNone(cp.launch_version_gate("4.8-beta1.official.x"))
+        self.assertIsNone(cp.launch_version_gate("4.8.stable.official.x"))
+        self.assertIsNone(cp.launch_version_gate("4.8.dev.custom_build"))
+
+    def test_gate_refuses_old(self):
+        for probe in ("4.7.2.stable.official.x", "4.5.1.stable.official"):
+            g = cp.launch_version_gate(probe)
+            self.assertIsNotNone(g, probe)
+            self.assertEqual(g["reason"], "godot_version")
+            self.assertIn(".".join(probe.split(".")[:2]), g["message"])
+            self.assertIn("4.8", " ".join(g["suggested"]))
+            self.assertIn("https://godotengine.org", " ".join(g["suggested"]))
+            self.assertIn("GODOT_EDITOR_BINARY", " ".join(g["suggested"]))
+
+    def test_gate_unparseable_fails(self):
+        g = cp.launch_version_gate("SIGSEGV or garbage")
+        self.assertIsNotNone(g)
+        self.assertEqual(g["reason"], "godot_version")
+
+    def test_gate_minimum_override(self):
+        # Floor is 4.8 (owner ruling); the parameterization stays so a
+        # future floor (e.g. 4.9) rises the same tested way.
+        self.assertIsNotNone(cp.launch_version_gate("4.7.2.stable"))
+        self.assertIsNone(cp.launch_version_gate("4.8.0", minimum=(4, 8)))
+        self.assertIsNotNone(cp.launch_version_gate("4.8.0", minimum=(4, 9)))
+
+    def test_probe_uses_injectable_runner(self):
+        seen = {}
+
+        def runner(cmd):
+            seen["cmd"] = cmd
+            return "4.7.2.stable.official.ed1daf0bf\n"
+
+        self.assertEqual(cp.probe_godot_version("/bin/godot", runner=runner),
+                         (4, 7))
+        self.assertEqual(seen["cmd"][0], "/bin/godot")
+        self.assertIn("--version", seen["cmd"])
+        self.assertIn("--headless", seen["cmd"])
+
+    def test_probe_runner_failure_is_none(self):
+        def boom(cmd):
+            raise OSError("no such binary")
+        self.assertIsNone(cp.probe_godot_version("/nope", runner=boom))
+
+
+class TestErrorSurfaceGuarantee(unittest.TestCase):
+    """Task 15: every non-zero CLI exit prints `Error [<class>]:` + a
+    `suggested:` line on stderr, and never a bare traceback. Subprocess
+    tests only — no Godot, no live editor.
+
+    Ruled exception (R16): `doctor` communicates via its own structured
+    output; its exit 1 means 'diagnosis found FAILs', not 'invocation
+    error' (like grep/test-runners). Pinned below.
+    """
+
+    CLI = os.path.join(os.path.dirname(__file__), "..", "cli",
+                       "editor_bridge_cli.py")
+
+    def _env(self, **over):
+        env = dict(os.environ)
+        env.pop("GODOT_EDITOR_BINARY", None)
+        env.update({k: v for k, v in over.items() if v is not None})
+        return env
+
+    def _run(self, *argv, cwd=None, env=None):
+        return subprocess.run([sys.executable, self.CLI] + list(argv),
+                              capture_output=True, text=True, timeout=30,
+                              cwd=cwd or os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                              env=env or self._env())
+
+    def _assert_clean_error(self, proc):
+        self.assertIn(proc.returncode, (1, 2),
+                      "exit=%s out=%r err=%r" % (proc.returncode, proc.stdout, proc.stderr))
+        self.assertIn("Error [", proc.stderr,
+                      "stderr lacked 'Error [': %r" % proc.stderr)
+        self.assertIn("suggested:", proc.stderr,
+                      "stderr lacked a suggested: line: %r" % proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("Traceback", proc.stdout)
+
+    def test_unknown_command(self):
+        self._assert_clean_error(self._run("frobnicate-the-bridge"))
+
+    def test_missing_required_args(self):
+        self._assert_clean_error(self._run("game", "get", "Some/Node"))
+
+    def test_bad_json_params_raises_classed_error(self):
+        # In-process pin: the subprocess game path pings the editor BEFORE
+        # parsing --json-params, so only a direct call proves the parse
+        # itself fails classed (SystemExit leaks sailed past every guard).
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._parse_json_params("{not json")
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertIn("not valid JSON", str(ctx.exception))
+        self.assertTrue(ctx.exception.suggested)
+
+    def test_non_object_json_params_raises_classed_error(self):
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._parse_json_params("[1, 2]")
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertTrue(ctx.exception.suggested)
+
+    def test_resolved_path_conflict_raises_classed_error(self):
+        # Same leak family as json-params: bare SystemExit bypassed every
+        # guard (ping-first masked it in subprocess tests).
+        import argparse
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._resolved_path(argparse.Namespace(path_pos="a.tscn",
+                                                  path="b.tscn"))
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertIn("given twice", str(ctx.exception))
+        self.assertTrue(ctx.exception.suggested)
+
+    def test_resolved_path_missing_raises_classed_error(self):
+        import argparse
+        with self.assertRaises(ebc.EditorBridgeError) as ctx:
+            ebc._resolved_path(argparse.Namespace(path_pos=None, path=None))
+        self.assertEqual(ctx.exception.reason, "bad_args")
+        self.assertIn("required", str(ctx.exception))
+        self.assertTrue(ctx.exception.suggested)
+
+    def test_game_command_without_editor(self):
+        # Hermetic skip: a dev editor on this mailbox makes editor_down
+        # unassertable here (CI runners are always clean).
+        if self._run("ping").returncode == 0:
+            self.skipTest("live editor answers this mailbox; editor_down "
+                          "surface not assertable")
+        proc = self._run("game", "scene-info")
+        self.assertIn(proc.returncode, (1, 2))
+        self.assertIn("Error [", proc.stderr, proc.stderr)
+        self.assertIn("suggested:", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_launch_outside_project(self):
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            # Mirror the contractual <project>/bridge/cli/ layout so PROJECT
+            # _ROOT resolves to the (project.godot-less) tmp root.
+            dest = os.path.join(tmp, "bridge", "cli")
+            os.makedirs(dest)
+            shutil.copy(self.CLI, os.path.join(dest, "editor_bridge_cli.py"))
+            shutil.copy(os.path.join(os.path.dirname(self.CLI), "cli_proc.py"),
+                        dest)
+            proc = subprocess.run([sys.executable,
+                                   os.path.join(dest, "editor_bridge_cli.py"),
+                                   "launch"],
+                                  capture_output=True, text=True, timeout=30,
+                                  env=self._env())
+            self._assert_clean_error(proc)
+            self.assertIn("bad_project", proc.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_launch_old_engine_classed(self):
+        import tempfile
+        fake = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+        fake.write("#!/bin/sh\necho '3.5.1.stable.official'\n")
+        fake.close()
+        os.chmod(fake.name, 0o755)
+        try:
+            proc = self._run("launch", env=self._env(GODOT_EDITOR_BINARY=fake.name))
+            self._assert_clean_error(proc)
+            self.assertIn("godot_version", proc.stderr)
+        finally:
+            os.unlink(fake.name)
+
+    def test_doctor_exception_to_rule(self):
+        # doctor's exit 1 is a RESULT, not an invocation error: no Error [ on
+        # stderr, structured checks on stdout, never a traceback.
+        proc = self._run("doctor", "--path", "/no/such/dir/xyzzy", "--json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("Error [", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertFalse(payload["ok"])
+
+
+    def test_no_systemexit_raises_in_cli_source(self):
+        # Guard the invariant that closed the audit (Task 15): SystemExit is
+        # a BaseException — it bypasses every handler in main(). Failures
+        # must go through EditorBridgeError / classed prints instead.
+        src = open(os.path.join(os.path.dirname(__file__), "..", "cli",
+                                "editor_bridge_cli.py"),
+                   encoding="utf-8").read()
+        src += open(os.path.join(os.path.dirname(__file__), "..", "cli",
+                                 "cli_proc.py"),
+                    encoding="utf-8").read()
+        self.assertNotIn("raise SystemExit", src)
+
+
+class TestWindowsProcessParity(unittest.TestCase):
+    """Task 16: Windows process handling through injectable seams.
+    All tests run on Linux with injected fakes; the real Windows proof is
+    the CI cli matrix (Windows runner) + the owner smoke checklist
+    (docs/HUMAN_GUIDE.md)."""
+
+    CSV = ('"ProcessId","CommandLine"\r\n'
+           '"111","C:\\Godot\\Godot_v4.7.2.exe --editor --path '
+           'C:\\Games\\MyGame"\r\n'
+           '"222","C:\\Godot\\Godot_v4.7.2.exe --path C:\\Games\\MyGame '
+           '--editor-pid 111"\r\n'
+           '"333","C:\\Windows\\notepad.exe"\r\n')
+
+    def test_windows_ps_command_shape(self):
+        cmd = cp.windows_ps_command()
+        self.assertEqual(cmd[0], "powershell")
+        joined = " ".join(cmd)
+        self.assertIn("Get-CimInstance", joined)
+        self.assertIn("Win32_Process", joined)
+        self.assertIn("ConvertTo-Csv", joined)
+
+    def test_parse_windows_procs(self):
+        procs = cp.parse_windows_procs(self.CSV)
+        self.assertEqual([p for p, _ in procs], [111, 222, 333])
+        self.assertTrue(cp.is_godot_editor(procs[0][1]))
+        self.assertTrue(cp.is_godot_game(procs[1][1]))
+        self.assertFalse(cp.is_godot_editor(procs[2][1]))
+        self.assertFalse(cp.is_godot_game(procs[2][1]))
+
+    def test_parse_windows_procs_malformed(self):
+        self.assertEqual(cp.parse_windows_procs(""), [])
+        self.assertEqual(cp.parse_windows_procs(None), [])
+        # junk rows (no int pid) are skipped, valid kept
+        procs = cp.parse_windows_procs('"ProcessId","CommandLine"\r\n'
+                                       '"abc","x"\r\n"7","godot --editor"\r\n')
+        self.assertEqual(procs, [(7, "godot --editor")])
+
+    def test_find_godot_procs_windows_branch(self):
+        procs = cp.find_godot_procs("C:\\Games\\MyGame", os_name="nt",
+                                    runner=lambda cmd: self.CSV)
+        self.assertEqual([p for p, _ in procs["editors"]], [111])
+        self.assertEqual([p for p, _ in procs["games"]], [222])
+
+    def test_find_godot_procs_windows_other_project_ignored(self):
+        procs = cp.find_godot_procs("C:\\Games\\Other", os_name="nt",
+                                    runner=lambda cmd: self.CSV)
+        self.assertEqual(procs, {"editors": [], "games": []})
+
+    def test_pid_alive_impl(self):
+        self.assertEqual(cp.pid_alive_impl("nt"), "pid_list")
+        self.assertEqual(cp.pid_alive_impl("posix"), "signal0")
+        self.assertEqual(cp.pid_alive_impl("posix2"), "signal0")
+
+    def test_kill_command(self):
+        self.assertEqual(cp.kill_command(4242, "nt"),
+                         ["taskkill", "/PID", "4242", "/F"])
+        self.assertEqual(cp.kill_command(4242, "posix"),
+                         ["kill", "-9", "4242"])
+
+    def test_kill_pid_nt_uses_taskkill_via_runner(self):
+        seen = {}
+
+        def runner(cmd):
+            seen["cmd"] = cmd
+            return ""
+
+        self.assertTrue(cp.kill_pid(4242, runner=runner, os_name="nt"))
+        self.assertEqual(seen["cmd"], ["taskkill", "/PID", "4242", "/F"])
+
+    def test_kill_pid_nt_failure_degrades_false(self):
+        def boom(cmd):
+            raise OSError("no taskkill")
+        self.assertFalse(cp.kill_pid(4242, runner=boom, os_name="nt"))
+
+    def test_pid_alive_nt_never_signals_uses_list(self):
+        # os.kill on Windows TERMINATES for any non-CTRL signal (incl. 0) —
+        # the nt route must consult the process list, never os.kill.
+        alive = cp.pid_alive(222, os_name="nt",
+                             runner=lambda cmd: self.CSV)
+        self.assertTrue(alive)
+        self.assertFalse(cp.pid_alive(999, os_name="nt",
+                                      runner=lambda cmd: self.CSV))
+
+    def test_pid_alive_nt_probe_failure_false(self):
+        def boom(cmd):
+            raise OSError("powershell missing")
+        self.assertFalse(cp.pid_alive(222, os_name="nt", runner=boom))
+
+    def test_pid_alive_posix_regression_signal0(self):
+        # signal-0 route unchanged on posix: our own pid is alive, huge pid
+        # is not.
+        self.assertTrue(cp.pid_alive(os.getpid()))
+        self.assertFalse(cp.pid_alive(2 ** 40))
+
+    # --- review fixes: detached spawn on nt + Windows path case ----------
+
+    CSV_RICH = ('"ProcessId","CommandLine"\r\n'
+                '"10","C:\\godot\\GODOT.exe --editor-pid 111 --path '
+                'c:\\games\\mygame"\r\n'
+                '"9","C:\\Program Files\\Godot X\\godot_landed.exe '
+                '--editor --path ""C:\\My Game, 2D"""\r\n')
+
+    def test_spawn_detach_kwargs_posix(self):
+        self.assertEqual(cp.spawn_detach_kwargs("posix"),
+                         {"start_new_session": True})
+
+    def test_spawn_detach_kwargs_nt(self):
+        kw = cp.spawn_detach_kwargs("nt")
+        self.assertIn("creationflags", kw)
+        # DETACHED_PROCESS (0x8) so console close can't kill the editor;
+        # CREATE_NEW_PROCESS_GROUP (0x200) so Ctrl-C can't reach it.
+        self.assertEqual(kw["creationflags"] & 0x8, 0x8)
+        self.assertEqual(kw["creationflags"] & 0x200, 0x200)
+
+    def test_same_path_nt_case_insensitive(self):
+        self.assertTrue(cp.same_path("C:\\Games\\MyGame",
+                                     "c:\\games\\mygame", os_name="nt"))
+        self.assertTrue(cp.same_path("C:/Games/MyGame",
+                                     "C:\\Games\\MyGame\\", os_name="nt"))
+
+    def test_same_path_posix_stays_case_sensitive(self):
+        self.assertFalse(cp.same_path("/Games/MyGame", "/games/mygame",
+                                      os_name="posix"))
+        self.assertTrue(cp.same_path("/Games/MyGame", "/Games/MyGame",
+                                     os_name="posix"))
+
+    def test_find_godot_procs_nt_matches_lowercase_proc_path(self):
+        # Editor was started with a lowercase --path (launcher/typed); CLI
+        # project root is title-case. Must STILL match (mailbox guard).
+        procs = cp.find_godot_procs("C:\\Games\\MyGame", os_name="nt",
+                                    runner=lambda cmd: self.CSV_RICH)
+        self.assertEqual([p for p, _ in procs["editors"]], [])
+        self.assertEqual([p for p, _ in procs["games"]], [10])
+
+    def test_find_godot_procs_nt_spaces_and_commas_in_path(self):
+        procs = cp.find_godot_procs("C:\\My Game, 2D", os_name="nt",
+                                    runner=lambda cmd: self.CSV_RICH)
+        self.assertEqual([p for p, _ in procs["editors"]], [9])
 
 
 if __name__ == "__main__":

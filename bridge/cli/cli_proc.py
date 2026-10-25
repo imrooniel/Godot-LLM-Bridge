@@ -10,6 +10,7 @@ Findings addressed: A2 (proc matching), A3 (path validation), C1/C2
 (orphan game detection), C3 (pid liveness vs heartbeat age).
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -66,12 +67,31 @@ def is_godot_game(cmdline: str) -> bool:
     return bool(tokens) and "--editor-pid" in tokens and "--editor" not in tokens
 
 
-def proc_path_arg(cmdline: str) -> str:
+_CMDLINE_TOKEN_RE = re.compile(r'"[^"]*"|\S+')
+
+
+def split_cmdline(cmdline: str) -> list:
+    """Tokenize a raw Windows command line (CIM form) keeping QUOTED runs
+    intact — `--path "C:\\My Game, 2D"` must survive as two tokens; naive
+    .split() fragments paths with spaces (double-editor guard blindspot).
+    """
+    return [t[1:-1] if len(t) >= 2 and t.startswith('"') and t.endswith('"')
+            else t for t in _CMDLINE_TOKEN_RE.findall(cmdline or "")]
+
+
+def proc_path_arg(cmdline: str, win32: bool = False) -> str:
     """Return the value of the first `--path <value>` in a cmdline, else "".
 
     Handles the engine's `%20`-encoded spaces and trailing slashes so the
     result can be normalized and compared to the project root (fixes A2(b):
     a truncated or normalized `--path` must still be detectable)."""
+    if win32:
+        # Quote-aware tokenizer FIRST: the naive split below fragments a
+        # quoted `--path "C:\\My Game, 2D"` into garbage prefixes.
+        wt = split_cmdline(cmdline)
+        for i, t in enumerate(wt):
+            if t.lower() == "--path" and i + 1 < len(wt):
+                return wt[i + 1].replace("%20", " ")
     tokens = cmdline.split()
     for i, t in enumerate(tokens):
         if t == "--path" and i + 1 < len(tokens):
@@ -79,23 +99,42 @@ def proc_path_arg(cmdline: str) -> str:
     return ""
 
 
-def same_path(a: str, b: str) -> bool:
+def same_path(a: str, b: str, os_name: str = None) -> bool:
     """Path equality after abspath normalization (handles trailing slash,
     `..`, `%20`). Used to decide whether a proc's `--path` targets THIS
-    project."""
+    project.
+
+    On Windows (os_name == "nt") also normcase: Windows paths are
+    case-insensitive, and a launcher- or hand-typed lowercase `--path` must
+    still match PROJECT_ROOT — otherwise the double-editor mailbox guard
+    silently disarms. posix stays case-sensitive (ntpath.normcase is used
+    explicitly so the decision is testable on any host)."""
     if not a or not b:
         return False
-    na = os.path.normpath(os.path.abspath(a))
-    nb = os.path.normpath(os.path.abspath(b))
+    if (os_name or os.name) == "nt":
+        import ntpath
+        # Full ntpath stack: it maps / -> \, drops trailing separators, and
+        # normcase lowercases (Windows paths are case-insensitive) — so a
+        # launcher/hand-typed lowercase --path still matches PROJECT_ROOT
+        # and the double-editor mailbox guard stays armed. Works on any
+        # host for drive-qualified paths (unit-testable from posix).
+        na = ntpath.normcase(ntpath.abspath(a))
+        nb = ntpath.normcase(ntpath.abspath(b))
+    else:
+        na = os.path.normpath(os.path.abspath(a))
+        nb = os.path.normpath(os.path.abspath(b))
     return na == nb
 
 
-def find_godot_procs(project_path: str, ps_out: str = None, pid: int = None):
+def find_godot_procs(project_path: str, ps_out: str = None,
+                    pid: int = None, os_name: str = None,
+                    runner=None):
     """Return {"editors": [(pid, cmdline)], "games": [(pid, cmdline)]} for
     Godot processes whose `--path` targets `project_path`.
 
-    `ps_out`/`pid` are injectable for tests. When `ps_out` is None we run
-    `ps -eo pid=,args=`. Degrades to empty dicts on any ps failure (the CLI
+    `ps_out`/`pid`/`os_name`/`runner` are injectable for tests. When
+    `ps_out` is None we run `ps -eo pid=,args=` (posix) or the CIM CSV
+    command (Windows, via `runner`). Degrades to empty dicts on any ps failure (the CLI
     then proceeds without pre-flight, same as today).
 
     The fix for A2: editors and games are matched SEPARATELY and correctly
@@ -104,18 +143,25 @@ def find_godot_procs(project_path: str, ps_out: str = None, pid: int = None):
     truncated/other-project path does NOT falsely match, and a game process
     is no longer mistaken for an editor.
     """
+    is_nt = (os_name or os.name) == "nt"
     if ps_out is None:
         try:
-            ps_out = subprocess.run(["ps", "-eo", "pid=,args="],
-                                    capture_output=True, text=True, timeout=5).stdout
-        except (OSError, subprocess.SubprocessError):
+            if is_nt:
+                ps_out = (runner or _windows_run)(windows_ps_command())
+            else:
+                ps_out = subprocess.run(["ps", "-eo", "pid=,args="],
+                                        capture_output=True, text=True,
+                                        timeout=5).stdout
+        except Exception:
             return {"editors": [], "games": []}
     if pid is None:
         pid = os.getpid()
     editors, games = [], []
-    for p, cmdline in parse_ps(ps_out, pid):
-        path = proc_path_arg(cmdline)
-        if not same_path(path, project_path):
+    entries = (parse_windows_procs(ps_out) if is_nt
+               else parse_ps(ps_out, pid))
+    for p, cmdline in entries:
+        path = proc_path_arg(cmdline, win32=is_nt)
+        if not same_path(path, project_path, os_name):
             continue
         if is_godot_editor(cmdline):
             editors.append((p, cmdline))
@@ -140,8 +186,11 @@ def should_kill_orphans(procs: dict, force: bool) -> bool:
     return force and bool(procs["games"])
 
 
-def pid_alive(pid: int) -> bool:
-    """True if `pid` is a live process on this host (signal-0 probe).
+def pid_alive(pid: int, runner=None, os_name=None) -> bool:
+    """True if `pid` is a live process on this host.
+
+    posix: signal-0 probe. Windows: the process list — os.kill(pid, 0)
+    there would TERMINATE it (non-CTRL signals map to TerminateProcess).
 
     This is the fix for C3: restart()'s death-wait must check PROCESS
     liveness, not the heartbeat age in state.json (a modal-blocked editor
@@ -149,6 +198,12 @@ def pid_alive(pid: int) -> bool:
     stale while still alive)."""
     if pid <= 0:
         return False
+    if pid_alive_impl(os_name or os.name) == "pid_list":
+        try:
+            text = (runner or _windows_run)(windows_ps_command())
+        except Exception:
+            return False
+        return any(p == pid for p, _ in parse_windows_procs(text))
     try:
         os.kill(pid, 0)
         return True
@@ -213,6 +268,16 @@ _REASON_CLASS = {
     "not_broken": "dap_not_breaked",
     "method_not_found": "bad_request",
     "policy_rejected": "policy_rejected",
+    "godot_version": "godot_version",
+    "bad_args": "bad_args",
+    "bad_project": "bad_project",
+    "godot_binary": "godot_binary",
+    "editor_running": "editor_running",
+    "launch_failed": "launch_failed",
+    "unexpected": "unexpected",
+    "scene_already_open": "scene_already_open",
+    "game_playing": "game_playing",
+    "dap_timeout": "dap_timeout",
 }
 _CODE_CLASS = {
     -32603: "load_failed",
@@ -295,3 +360,345 @@ def suite_marker(result) -> str:
     if isinstance(result.get("fail"), int) and result["fail"] != 0:
         return "INCOMPLETE"
     return "TRUSTWORTHY"
+
+
+# ---------------------------------------------------------------------------
+# doctor — pure setup diagnosis
+# ---------------------------------------------------------------------------
+
+# Godot version floor (keep in sync with README requirements table and CI):
+# owner ruling 2026-10-25 — the bridge requires Godot 4.8, nothing less.
+# CI pins official 4.8-beta1 until 4.8-stable ships (prerelease build,
+# same supported floor).
+DOCTOR_MIN_GODOT = (4, 8)
+
+
+def _parse_ver(s):
+    """'4.7' / '4.8.dev' -> (4, 7); anything unparseable -> None."""
+    try:
+        parts = str(s).strip().split(".")
+        return (int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return None
+
+
+def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
+                    python_version, godot_version_out, heartbeat_age_s,
+                    os_name, heartbeat_stale_s=2.0):
+    """Diagnose a bridge install from static facts only (no live editor).
+
+    Returns a list of Check dicts: {name, status: ok|fail|warn, detail, fix}.
+    `fix` is None for passing checks. Exit code policy lives in the CLI:
+    0 iff no check has status 'fail'.
+
+    Pure: all inputs are plain values so this is fully unit-testable.
+    """
+    checks = []
+
+    def add(name, status, detail, fix=None):
+        checks.append({"name": name, "status": status, "detail": detail,
+                       "fix": fix})
+
+    if not project_exists:
+        add("project_godot", "fail",
+            "no project.godot in this directory",
+            "Run the doctor from your Godot project root (the directory "
+            "containing project.godot), or pass --path /to/your/project.")
+        return checks
+    add("project_godot", "ok", "project.godot found")
+
+    # Godot feature floor (owner ruling: 4.8 only — no 4.7 band).
+    ver = _parse_ver(features)
+    if ver is None:
+        add("godot_features", "warn",
+            "could not read config/features from project.godot",
+            "Open the project once in Godot 4.8+ so project.godot is saved.")
+    elif ver < DOCTOR_MIN_GODOT:
+        add("godot_features", "fail",
+            "project features say Godot %d.%d — below the supported floor"
+            % ver,
+            "Open and save the project with Godot >= %d.%d (see README "
+            "Requirements; 4.8-beta1 or newer, 4.8-stable when it ships)."
+            % DOCTOR_MIN_GODOT)
+    else:
+        add("godot_features", "ok", "Godot %d.%d+ features" % ver)
+
+    # Python floor (bridge/cli is stdlib-only, >= 3.9).
+    if tuple(python_version) < (3, 9):
+        add("python_version", "fail",
+            "Python %s < 3.9" % ".".join(str(p) for p in python_version),
+            "Run the CLI with Python 3.9+ (e.g. `python3.11 bridge/cli/"
+            "editor_bridge_cli.py ...`); CI is tested on 3.11/3.12.")
+    else:
+        add("python_version", "ok",
+            "Python %s" % ".".join(str(p) for p in python_version))
+
+    # Godot binary discovery (needed for `launch`/`restart`).
+    if godot_version_out is None:
+        add("godot_binary", "fail",
+            "no Godot binary found (launch/restart would not work)",
+            "Set GODOT_EDITOR_BINARY, or write the binary path to a "
+            ".godot-editor-path file in your project root, or put godot on "
+            "PATH (see CONTRIBUTING dev setup).")
+    else:
+        add("godot_binary", "ok", "Godot binary answers: %s"
+            % str(godot_version_out).strip())
+
+    # Autoload registration — anchored match: a near-name
+    # (MyDebugBridge=) or a commented line (already filtered upstream in
+    # the reader) must NOT read as registered.
+    registered = any(re.match(r"\s*DebugBridge\s*=", line)
+                     for line in autoload_lines)
+    if registered:
+        add("autoload_debug_bridge", "ok", "DebugBridge autoload registered")
+    else:
+        add("autoload_debug_bridge", "fail",
+            "DebugBridge autoload missing from project.godot [autoload]",
+            "Add to project.godot [autoload]: "
+            'DebugBridge="*res://bridge/autoloads/debug_bridge.gd"')
+
+    # Editor plugins (both must be enabled). Comment lines are filtered
+    # defensively (the CLI reader strips them too): a commented-out
+    # registration is NOT registered.
+    plugins_blob = "\n".join(l for l in plugin_lines
+                             if not l.strip().startswith(";"))
+    needed = ["res://bridge/editor_bridge/plugin.cfg",
+              "res://bridge/human_edit/plugin.cfg"]
+    missing = [p for p in needed if p not in plugins_blob]
+    if not missing:
+        add("editor_plugins", "ok", "both editor plugins enabled")
+    else:
+        add("editor_plugins", "fail",
+            "missing plugin entries: %s" % ", ".join(missing),
+            "Set in project.godot: enabled=PackedStringArray("
+            '"res://bridge/editor_bridge/plugin.cfg", '
+            '"res://bridge/human_edit/plugin.cfg") '
+            "(or enable Editor Bridge + HumanEdit under "
+            "Project Settings -> Plugins)")
+
+    # Editor liveness — warn only: the doctor works with no editor running.
+    if heartbeat_age_s is None:
+        add("editor_heartbeat", "warn",
+            "no editor heartbeat (state.json missing) — editor not running?",
+            "Start the editor through the CLI: `... editor_bridge_cli.py "
+            "launch` (this is fine if you only wanted a setup check).")
+    elif heartbeat_age_s > heartbeat_stale_s:
+        add("editor_heartbeat", "warn",
+            "editor heartbeat stale (%.1fs old) — editor closed or busy?"
+            % heartbeat_age_s,
+            "Check `query state`; then `recover` once, or `launch` a fresh "
+            "editor.")
+    else:
+        add("editor_heartbeat", "ok",
+            "editor heartbeat fresh (%.1fs)" % heartbeat_age_s)
+
+    # OS support statement (macOS untested).
+    if os_name == "Darwin":
+        add("os_support", "warn",
+            "macOS is not an officially supported platform (untested)",
+            "It generally works — but file issues with details, and expect "
+            "Linux/Windows to be validated first.")
+    else:
+        add("os_support", "ok", "%s is supported" % os_name)
+
+    return checks
+
+
+# ---------------------------------------------------------------------------
+# launch version gate — refuse engines below the supported floor
+# ---------------------------------------------------------------------------
+
+# Floor mirrors doctor. Owner ruling 2026-10-25: Godot 4.8 only — nothing
+# less. CI pins 4.8-beta1 (official prerelease) until 4.8-stable ships;
+# keep README + CI pin + this constant in lockstep (one commit).
+LAUNCH_MIN_GODOT = (4, 8)
+
+
+def parse_godot_version(text):
+    """'4.8.stable.official.x' / '4.7.2...' / '4.8.dev.custom' -> (4, 8)/(4, 7).
+
+    Returns None for None/empty/garbage.
+    """
+    if not text:
+        return None
+    m = re.search(r"(\d+)\.(\d+)", str(text))
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def godot_version_supported(version, minimum=LAUNCH_MIN_GODOT):
+    """True iff version tuple >= minimum. None (unparseable) is unsupported."""
+    return version is not None and version >= tuple(minimum)
+
+
+def version_probe_text(binary, runner=None):
+    """Run `<binary> --version --headless` and return raw output text.
+
+    `runner(cmd_list) -> str` is injectable (tests never spawn processes;
+    Task 16 reuses this seam). Returns None on any failure (missing binary,
+    timeout, spawn error).
+    """
+    cmd = [binary, "--version", "--headless"]
+    if runner is None:
+        runner = _version_runner_subprocess
+    try:
+        return runner(cmd)
+    except Exception:
+        return None
+
+
+def _version_runner_subprocess(cmd):
+    out = subprocess.run(list(cmd), capture_output=True, text=True,
+                         timeout=20)
+    return (out.stdout or "") + (out.stderr or "")
+
+
+def probe_godot_version(binary, runner=None):
+    """Version tuple of `binary`, or None."""
+    return parse_godot_version(version_probe_text(binary, runner=runner))
+
+
+def launch_version_gate(version_text, minimum=LAUNCH_MIN_GODOT):
+    """None if launch may proceed; else an EditorBridgeError payload dict
+    {message, reason, suggested} for the CLI to raise."""
+    v = parse_godot_version(version_text)
+    if godot_version_supported(v, minimum):
+        return None
+    if v is None:
+        snippet = str(version_text or "").strip().replace("\n", " ")[:60]
+        message = ("cannot determine the Godot version of this binary "
+                   "(answered: %r) — this bridge requires Godot >= %d.%d"
+                   % (snippet, minimum[0], minimum[1]))
+    else:
+        message = ("Godot %d.%d is not supported by this bridge — it "
+                   "requires Godot >= %d.%d"
+                   % (v[0], v[1], minimum[0], minimum[1]))
+    return {
+        "message": message,
+        "reason": "godot_version",
+        "suggested": [
+            "install Godot >= %d.%d from https://godotengine.org"
+            % (minimum[0], minimum[1]),
+            "or point the CLI at a supported binary via GODOT_EDITOR_BINARY "
+            "or a .godot-editor-path file (see CONTRIBUTING dev setup)",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Windows process parity — ps/kill equivalents behind injectable seams
+# ---------------------------------------------------------------------------
+# On Windows there is no `ps`, and os.kill(pid, 0) TERMINATES the process
+# (any non-CTRL signal maps to TerminateProcess there). Every process probe
+# and kill therefore routes through these helpers, selected by os_name, with
+# an injectable `runner(cmd_list) -> str` (tests never spawn; unit tests run
+# on Linux with fixtures).
+
+import csv as _csv
+import io as _io
+import signal as _signal
+
+
+def windows_ps_command():
+    """Windows equivalent of `ps -eo pid=,args=` as a command list.
+
+    CIM carries full command lines (Win32_Process.CommandLine); CSV keeps
+    parse_windows_procs dead simple and quoting-correct for paths with spaces.
+    """
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId,CommandLine | ConvertTo-Csv "
+            "-NoTypeInformation"]
+
+
+def parse_windows_procs(csv_text):
+    """Parse ConvertTo-Csv output into [(pid:int, cmdline:str)].
+
+    Skips the header row, rows without an int pid, and empty text. A quoted
+    CommandLine containing spaces/commas survives intact (csv module).
+    """
+    if not csv_text:
+        return []
+    try:
+        rows = list(_csv.reader(_io.StringIO(csv_text)))
+    except _csv.Error:
+        return []
+    procs = []
+    for row in rows:
+        if len(row) < 2:
+            continue
+        pid_s, cmd = row[0], row[1]
+        if pid_s.strip().lower() == "processid":  # header
+            continue
+        try:
+            p = int(pid_s)
+        except ValueError:
+            continue
+        procs.append((p, cmd or ""))
+    return procs
+
+
+def _windows_run(cmd):
+    """Default Windows command runner: stdout text, bounded."""
+    out = subprocess.run(list(cmd), capture_output=True, text=True,
+                         timeout=15)
+    return out.stdout or ""
+
+
+def pid_alive_impl(os_name):
+    """Which liveness probe the platform must use.
+
+    'signal0'  — os.kill(pid, 0) (posix; safe there).
+    'pid_list' — consult the process list (Windows: os.kill would TERMINATE).
+    """
+    return "pid_list" if os_name == "nt" else "signal0"
+
+
+def kill_command(pid, os_name):
+    """Force-kill command list for the platform."""
+    if os_name == "nt":
+        return ["taskkill", "/PID", str(pid), "/F"]
+    return ["kill", "-9", str(pid)]
+
+
+def kill_pid(pid, runner=None, os_name=None):
+    """Force-kill a process platform-appropriately. Best-effort bool.
+
+    posix: os.kill(SIGKILL) — no subprocess needed.
+    Windows: taskkill /F via `runner` (default: subprocess).
+    """
+    os_name = os_name or os.name
+    if pid_alive_impl(os_name) == "signal0":
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            return True
+        except OSError:
+            return False
+    try:
+        (runner or _windows_run)(kill_command(pid, "nt"))
+        return True
+    except Exception:
+        return False
+
+
+def spawn_detach_kwargs(os_name):
+    """Popen kwargs detaching the spawned editor from the CLI's console.
+
+    Without detachment the editor shares the CLI's console/process group:
+    Ctrl-C or closing the terminal window (CTRL_CLOSE_EVENT) takes the
+    editor down WITH unsaved scene edits — the exact hazard this prevents.
+
+    posix:  start_new_session (setsid). NOTE: Popen kwarg, NOT a subprocess
+            module attribute.
+    Windows: DETACHED_PROCESS (0x8, no console inherited — requires stdio
+            redirected/DEVNULL, which launch() does) +
+            CREATE_NEW_PROCESS_GROUP (0x200, Ctrl-C can't reach it).
+            Constants are literals with getattr fallback: they exist on
+            Windows Python only, but tests run this branch everywhere.
+    """
+    if os_name == "posix":
+        return {"start_new_session": True}
+    return {"creationflags": (getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                              | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP",
+                                        0x200))}
