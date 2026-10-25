@@ -29,8 +29,9 @@ The game bridge is **single-client and serializes one request at a time.** Two c
    can read the *previous* pending response, and a mid-request bridge drop shows
    `game bridge disconnected mid-request`. Insert a `sleep 2` (or longer) between each `game`
    call, or run them as separate tool calls.
-2. **Idempotent reads auto-retry; mutations don't.** `game get`, `get-many`, `watch`,
-   `sample`, `held-keys`, `screenshot`, etc. are retried up to 3× on a transient drop.
+2. **Idempotent reads auto-retry; mutations don't.** `game get`, `get-many`,
+   `sample`, `held-keys`, `screenshot`, etc. (the idempotent reads — note `watch` is
+   NOT in the retry set) are retried up to 3× on a transient drop.
    `hold`/`release`/`set`/`call` are NOT retried (a blind re-send could double-apply) — after a
    mutation, re-read state to confirm it applied. Use `--no-retry` to disable read retry.
 

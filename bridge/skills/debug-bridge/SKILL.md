@@ -156,7 +156,7 @@ python3 bridge/cli/editor_bridge_cli.py game telemetry-stop
 ```
 
 > **Single-client bridge:** space out `game` calls (a burst can read the previous pending
-> response). Idempotent reads (get/get-many/watch/sample/held-keys/screenshot) auto-retry up
+> response). Idempotent reads (e.g. get/get-many/sample/held-keys/screenshot) auto-retry up
 > to 3× on a transient drop; mutations (set/hold/release/call) never blind-retry. `--no-retry`
 > disables read retry. See the `drive` skill for the full closed-loop workflow.
 
@@ -240,7 +240,7 @@ a missing console summary is never a pass (S2/S8).
 ## Common Mistakes
 
 - **`game.*` without a running game** → `Game bridge unreachable`. `game ping` first; start the game with `action scene-play`.
-- **Orphaned game process** → a leftover game process crashes a new editor on launch. `action scene-stop` (or kill the game) before restarting the editor.
+- **Orphaned game process** → doesn't crash the editor (launch warns), but it can hold bridge port 5555 so the new game binds another port and the proxy may talk to the wrong process. `action scene-stop` (or kill the game) before restarting.
 - **Wrong `game` subcommand spelling** → they are **hyphenated**: `lua-eval`, `scan-ui`, `find-nodes`, `click-node`, `time-scale`, `screenshot-b64`, `clear-logs`, `game-status`, `inspect-tree`, `inspect-control`. The CLI rejects the underscore forms.
 - **Compound bash commands** → prefer one command per tool call where possible.
 - **`time-scale 0.0`** → doesn't crash, but freezes the game AND stalls the game bridge (its socket-poll Timer ticks in scaled time; later `game.*` commands time out). Use ≥ 0.1; recover from a stuck 0 with `action scene-stop` or `recover`.
