@@ -42,7 +42,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: CLI test suite (stdlib unittest)
         run: python bridge/tests/test_cli.py
-      - name: Version consistency (VERSION == plugin.cfg == docs)
+      - name: Version consistency (VERSION == plugin.cfg copies)
         run: python scripts/check_version.py
 
   gd-headless:
@@ -98,6 +98,13 @@ jobs:
           echo "GODOT_EDITOR_BINARY=$PWD/Godot_v${GODOT_VERSION}-stable_linux.x86_64" >> "$GITHUB_ENV"
       - name: Install xvfb
         run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+      - name: Start Xvfb
+        # NOTE: bare Xvfb + DISPLAY, NOT xvfb-run — `launch` detaches the
+        # editor (start_new_session), so an xvfb-run wrapper would take the
+        # X server down when the CLI process exits.
+        run: |
+          Xvfb :99 -screen 0 1280x720x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
       - name: Drive the bridge end-to-end
         run: |
           set -uo pipefail
@@ -123,9 +130,13 @@ jobs:
           step "ping (heartbeat)" $CLI ping
           step "fs-scan"          $CLI action fs-scan --wait
           step "scene-play demo"  $CLI action scene-play --path res://scenes/main.tscn
-          # game bridge needs a moment to come up with the game process
+          # game ping exits 0 with game_bridge:false (envelope is ok:true),
+          # so assert the payload field — and note the editor being alive
+          # is NOT proof the game bridge bound its port.
           for i in $(seq 1 30); do
-            if $CLI game ping >/dev/null 2>&1; then echo "game ping: ok (try $i)"; break; fi
+            if $CLI game ping 2>/dev/null | grep -q '"game_bridge": *true'; then
+              echo "game ping: game_bridge true (try $i)"; break
+            fi
             [ "$i" = 30 ] && { echo "::error::game bridge never came up"; dump_diagnostics; exit 1; }
             sleep 1
           done
