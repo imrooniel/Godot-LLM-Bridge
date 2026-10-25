@@ -6,7 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.0.0] - unreleased
 
-Open-source Community Edition release. `VERSION` at the repo root is the
+Open-source Community Edition release.
+
+> **Requirement (owner ruling, 2026-10-25): Godot 4.8 only.** The bridge
+> requires the 4.8 engine — 4.7 and below are unsupported (`launch` refuses
+> them, `doctor` fails them, CI is gated on the official 4.8-beta1 milestone
+> until 4.8-stable ships). `VERSION` at the repo root is the
 single source of truth for versioning; `scripts/check_version.py` (and CI)
 verify both `bridge/*/plugin.cfg` files match it.
 
@@ -26,20 +31,21 @@ verify both `bridge/*/plugin.cfg` files match it.
   1 is a diagnosis result with structured output, not an invocation error.
 - Launch version gate: `launch` (and therefore `restart`/`recover`) probes
   `<binary> --version --headless` and refuses engines below the supported
-  floor (4.7 today) with `Error [godot_version]` + install/repin suggestions
+  floor (4.8 — see the Requirement below) with `Error [godot_version]` + install/repin suggestions
   — no more silent misbehavior on 3.x/old engines; unparseable version
   output refuses too. Probe uses an injectable runner seam (unit-testable,
   no process spawns).
 - `doctor` command: static setup diagnosis (project file, Godot feature
-  floor 4.7+/4.8-for-DAP, Python floor, Godot binary discovery, autoload +
+  floor (4.8), Python floor, Godot binary discovery, autoload +
   plugin registration, editor heartbeat, OS support) with an actionable
   `fix:` per failure; `--json` envelope; exit 0 iff no FAIL — the
   troubleshooting entry point referenced by the README and issue templates.
 - CI: CLI test matrix (ubuntu/windows × Python 3.11/3.12), GDScript suite on
-  a checksum-pinned official Godot (4.7.2-stable), and an xvfb integration
+  a checksum-pinned official Godot (4.8-beta1 milestone — CI moves to
+  4.8-stable the day it ships), and an xvfb integration
   job that drives the real editor + game end-to-end; issue + PR templates.
 - README rewritten as the stranger install path: requirements table
-  (4.7+ core / 4.8+ for DAP, Windows + Linux), exact install snippets,
+  (**Godot 4.8 only**, Windows + Linux), exact install snippets,
   OpenCode skills section, first-session walkthrough, troubleshooting table.
 
 ### Added — S-series (upstreamed from MergingWorlds)

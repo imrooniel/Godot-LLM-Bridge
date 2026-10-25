@@ -366,10 +366,11 @@ def suite_marker(result) -> str:
 # doctor — pure setup diagnosis
 # ---------------------------------------------------------------------------
 
-# Godot version floors (keep in sync with README requirements table and CI):
-# core bridge features are CI-gated on 4.7; DAP commands need engine 4.8+.
-DOCTOR_MIN_GODOT = (4, 7)
-DOCTOR_DAP_GODOT = (4, 8)
+# Godot version floor (keep in sync with README requirements table and CI):
+# owner ruling 2026-10-25 — the bridge requires Godot 4.8, nothing less.
+# CI pins official 4.8-beta1 until 4.8-stable ships (prerelease build,
+# same supported floor).
+DOCTOR_MIN_GODOT = (4, 8)
 
 
 def _parse_ver(s):
@@ -406,23 +407,19 @@ def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
         return checks
     add("project_godot", "ok", "project.godot found")
 
-    # Godot feature floor (README: 4.7+ core, 4.8+ for DAP commands).
+    # Godot feature floor (owner ruling: 4.8 only — no 4.7 band).
     ver = _parse_ver(features)
     if ver is None:
         add("godot_features", "warn",
             "could not read config/features from project.godot",
-            "Open the project once in Godot 4.7+ so project.godot is saved.")
+            "Open the project once in Godot 4.8+ so project.godot is saved.")
     elif ver < DOCTOR_MIN_GODOT:
         add("godot_features", "fail",
             "project features say Godot %d.%d — below the supported floor"
             % ver,
             "Open and save the project with Godot >= %d.%d (see README "
-            "Requirements)." % DOCTOR_MIN_GODOT)
-    elif ver < DOCTOR_DAP_GODOT:
-        add("godot_features", "warn",
-            "Godot %d.%d project: core bridge works, but `debugger ...` "
-            "commands need the 4.8+ engine DAP server" % ver,
-            "For DAP commands, open the project with Godot >= 4.8.")
+            "Requirements; 4.8-beta1 or newer, 4.8-stable when it ships)."
+            % DOCTOR_MIN_GODOT)
     else:
         add("godot_features", "ok", "Godot %d.%d+ features" % ver)
 
@@ -511,9 +508,10 @@ def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
 # launch version gate — refuse engines below the supported floor
 # ---------------------------------------------------------------------------
 
-# Floor mirrors doctor (core CI-gated on 4.7; DAP needs 4.8 — raise this to
-# (4, 8) when 4.8-stable ships, same commit as the CI pin bump).
-LAUNCH_MIN_GODOT = (4, 7)
+# Floor mirrors doctor. Owner ruling 2026-10-25: Godot 4.8 only — nothing
+# less. CI pins 4.8-beta1 (official prerelease) until 4.8-stable ships;
+# keep README + CI pin + this constant in lockstep (one commit).
+LAUNCH_MIN_GODOT = (4, 8)
 
 
 def parse_godot_version(text):

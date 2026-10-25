@@ -52,7 +52,7 @@ inspection tool — the authoritative table."** The editor-side (non-game) chann
 | evaluate ONE editor expression | `action eval "<expr>"` | single expression; policy-checked |
 | read the human's edits since last turn | `query human-deltas [--since <turn>]` | content deltas (turn handoff) |
 | something wedged | `recover` | relaunch editor / kill orphan / replay scene / continue a breaked game |
-| is the SETUP right (install/diagnosis)? | `doctor [--path DIR] [--json]` | static checks: project file, Godot feature floor (4.7+/4.8-DAP), Python, binary discovery, autoload+plugin registration, heartbeat, OS; one `fix:` per FAIL; exit 0 iff no FAIL; works with no editor running — run it FIRST when a stranger's bridge misbehaves |
+| is the SETUP right (install/diagnosis)? | `doctor [--path DIR] [--json]` | static checks: project file, Godot feature floor (4.8 required), Python, binary discovery, autoload+plugin registration, heartbeat, OS; one `fix:` per FAIL; exit 0 iff no FAIL; works with no editor running — run it FIRST when a stranger's bridge misbehaves |
 
 ## Editing bridge commands without restarting the editor
 

@@ -569,12 +569,14 @@ class TestDoctorEvaluate(unittest.TestCase):
         c = self._by_name(self._checks(features="4.6"), "godot_features")
         self.assertEqual(c["status"], "fail")
         self.assertEqual(c["name"], "godot_features")
-        self.assertIn("4.7", c["detail"] + c["fix"])
+        self.assertIn("4.8", c["detail"] + c["fix"])
 
-    def test_feature_4_7_warns_dap_needs_4_8(self):
+    def test_feature_4_7_fails_owner_ruling(self):
+        # Owner ruling (2026-10-25): the bridge requires Godot 4.8 — the
+        # old 4.7-warn band is revoked; 4.7 is a hard FAIL.
         c = self._by_name(self._checks(features="4.7"), "godot_features")
-        self.assertEqual(c["status"], "warn")
-        self.assertIn("4.8", c["detail"])
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("4.8", c["detail"] + c["fix"])
 
     def test_feature_4_8_plus_ok(self):
         for f in ("4.8", "4.9", "5.0"):
@@ -684,9 +686,9 @@ class TestDoctorCliWiring(unittest.TestCase):
 
 
 class TestLaunchVersionGate(unittest.TestCase):
-    """launch must refuse Godot below the supported floor (4.7 core floor
-    per CI pin/R13-R14; `minimum` parameterizable so the floor can rise to
-    4.8 when 4.8-stable ships)."""
+    """launch must refuse Godot below the supported floor. Owner ruling
+    (2026-10-25): 4.8 ONLY — nothing less. CI pins official 4.8-beta1 until
+    4.8-stable ships (same floor, prerelease build)."""
 
     def test_parse_stable(self):
         self.assertEqual(cp.parse_godot_version("4.8.stable.official.abc\n"),
@@ -704,25 +706,27 @@ class TestLaunchVersionGate(unittest.TestCase):
         self.assertIsNone(cp.parse_godot_version(None))
 
     def test_supported(self):
-        self.assertTrue(cp.godot_version_supported((4, 7)))
         self.assertTrue(cp.godot_version_supported((4, 8)))
+        self.assertTrue(cp.godot_version_supported((4, 9)))
         self.assertTrue(cp.godot_version_supported((5, 0)))
         self.assertFalse(cp.godot_version_supported((4, 6)))
-        self.assertFalse(cp.godot_version_supported((4, 7), minimum=(4, 8)))
+        self.assertFalse(cp.godot_version_supported((4, 7)))
         self.assertFalse(cp.godot_version_supported(None))
 
     def test_gate_passes_supported(self):
-        self.assertIsNone(cp.launch_version_gate("4.7.2.stable.official.x"))
+        self.assertIsNone(cp.launch_version_gate("4.8-beta1.official.x"))
+        self.assertIsNone(cp.launch_version_gate("4.8.stable.official.x"))
         self.assertIsNone(cp.launch_version_gate("4.8.dev.custom_build"))
 
     def test_gate_refuses_old(self):
-        g = cp.launch_version_gate("4.5.1.stable.official")
-        self.assertIsNotNone(g)
-        self.assertEqual(g["reason"], "godot_version")
-        self.assertIn("4.5", g["message"])
-        self.assertIn("4.7", " ".join(g["suggested"]))
-        self.assertIn("https://godotengine.org", " ".join(g["suggested"]))
-        self.assertIn("GODOT_EDITOR_BINARY", " ".join(g["suggested"]))
+        for probe in ("4.7.2.stable.official.x", "4.5.1.stable.official"):
+            g = cp.launch_version_gate(probe)
+            self.assertIsNotNone(g, probe)
+            self.assertEqual(g["reason"], "godot_version")
+            self.assertIn(".".join(probe.split(".")[:2]), g["message"])
+            self.assertIn("4.8", " ".join(g["suggested"]))
+            self.assertIn("https://godotengine.org", " ".join(g["suggested"]))
+            self.assertIn("GODOT_EDITOR_BINARY", " ".join(g["suggested"]))
 
     def test_gate_unparseable_fails(self):
         g = cp.launch_version_gate("SIGSEGV or garbage")
@@ -730,10 +734,11 @@ class TestLaunchVersionGate(unittest.TestCase):
         self.assertEqual(g["reason"], "godot_version")
 
     def test_gate_minimum_override(self):
-        # 4.7 passes today's floor but would fail a raised 4.8 floor.
-        self.assertIsNone(cp.launch_version_gate("4.7.2.stable"))
-        self.assertIsNotNone(cp.launch_version_gate("4.7.2.stable",
-                                                    minimum=(4, 8)))
+        # Floor is 4.8 (owner ruling); the parameterization stays so a
+        # future floor (e.g. 4.9) rises the same tested way.
+        self.assertIsNotNone(cp.launch_version_gate("4.7.2.stable"))
+        self.assertIsNone(cp.launch_version_gate("4.8.0", minimum=(4, 8)))
+        self.assertIsNotNone(cp.launch_version_gate("4.8.0", minimum=(4, 9)))
 
     def test_probe_uses_injectable_runner(self):
         seen = {}

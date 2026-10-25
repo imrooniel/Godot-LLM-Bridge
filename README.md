@@ -15,13 +15,15 @@ their own RPC handlers).
 
 | | |
 |---|---|
-| **Godot** | **4.7+** for the core bridge (CI-tested on 4.7.2). `debugger …` commands need **4.8+** — the engine's built-in Debug Adapter Protocol server is 4.8+ only; on 4.7 they answer a clear "DAP not connected" error (or `connected: false`), everything else works. |
+| **Godot** | **4.8 only** — the bridge requires the 4.8 engine (this is where the engine's built-in Debug Adapter Protocol server lands, and it is the CI-gated baseline: `4.8-beta1` official milestone build until `4.8-stable` ships). Older engines (4.7 and below) are explicitly unsupported; `launch` refuses them with `Error [godot_version]`. |
 | **OS** | Windows 10/11 and Linux (CLI test suite CI-covered on both; the editor-runtime integration job is Linux-only today). macOS is not tested and out of scope for support; community patches welcome. |
 | **Python** | 3.9+ (CLI is stdlib-only — zero pip installs; CI-tested on 3.11 & 3.12). |
 
-> As of Oct 2026 the newest **official stable** Godot is 4.7.2; 4.8 lives in
-> dev builds. The bridge is developed against 4.8-dev and gated on 4.7.2 in
-> CI, so 4.8 regressions get caught when 4.8-stable lands.
+> As of Oct 2026 `4.8-stable` has not shipped yet — use the official
+> [`4.8-beta1`](https://github.com/godotengine/godot-builds/releases/tag/4.8-beta1)
+> milestone build (or any newer 4.8 dev build). The bridge is developed
+> against 4.8 and CI-gated on 4.8-beta1; when 4.8-stable lands the CI pin
+> moves to it immediately, the requirement does not change.
 
 ## Install (5 minutes)
 

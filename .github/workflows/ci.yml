@@ -1,10 +1,11 @@
 # CI for Godot-LLM-Bridge — the install-path proof for every PR.
 #
-# GODOT_VERSION policy: pin an OFFICIAL stable release (reproducible,
-# checksummed). Currently 4.7.2-stable — the core bridge and all GD tests
-# pass there (verified 2026-10-25). DAP commands (`debugger ...`) need a
-# 4.8+ engine and are exercised in dev, not CI. Bump this pin when a new
-# stable drops; do not chase dev builds.
+# GODOT_VERSION policy (owner ruling 2026-10-25: the bridge requires Godot
+# 4.8 — nothing less): pin an OFFICIAL release build, checksum-verified.
+# 4.8-stable does not exist yet, so CI pins the official 4.8-beta1 milestone
+# from godotengine/godot-builds (frozen, immutable assets — as reproducible
+# as a stable release; daily dev builds are NOT pinned). Bump to 4.8-stable
+# the day it ships (same commit raises nothing — the floor is already 4.8).
 name: CI
 
 on:
@@ -21,9 +22,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GODOT_VERSION: "4.7.2"
-  # sha256 of Godot_v<ver>-stable_linux.x86_64.zip from the official release
-  GODOT_SHA256_LINUX_ZIP: "cadd3204e728a35d3f13adb7fd0d7902636b79f6b95c40c265eb73b6c35329e4"
+  GODOT_VERSION: "4.8-beta1"
+  # sha256 of Godot_v<ver>_linux.x86_64.zip from the official milestone
+  # release (godotengine/godot-builds; 4.8-beta1, verified locally 2026-10-26
+  # — the full GD suite passes on this exact binary).
+  GODOT_SHA256_LINUX_ZIP: "199b2d6a0daa3a74a697356f31c33347f997f65258ba7dd07ca8c1110757927d"
+  GODOT_ZIP_BASE: "https://github.com/godotengine/godot-builds/releases/download"
 
 jobs:
   cli:
@@ -57,12 +61,12 @@ jobs:
       - name: Download pinned Godot (checksum-verified)
         run: |
           set -euo pipefail
-          URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
-          curl -fsSL -o godot.zip "$URL"
+          BIN="Godot_v${GODOT_VERSION}_linux.x86_64"
+          curl -fsSL -o godot.zip "${GODOT_ZIP_BASE}/${GODOT_VERSION}/${BIN}.zip"
           echo "${GODOT_SHA256_LINUX_ZIP}  godot.zip" | sha256sum -c -
           unzip -q godot.zip
-          chmod +x "Godot_v${GODOT_VERSION}-stable_linux.x86_64"
-          echo "GODOT=$PWD/Godot_v${GODOT_VERSION}-stable_linux.x86_64" >> "$GITHUB_ENV"
+          chmod +x "$BIN"
+          echo "GODOT=$PWD/$BIN" >> "$GITHUB_ENV"
       - name: Run GD test suite (each test quits 0/1)
         run: |
           set -uo pipefail
@@ -93,12 +97,12 @@ jobs:
       - name: Download pinned Godot (checksum-verified)
         run: |
           set -euo pipefail
-          URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
-          curl -fsSL -o godot.zip "$URL"
+          BIN="Godot_v${GODOT_VERSION}_linux.x86_64"
+          curl -fsSL -o godot.zip "${GODOT_ZIP_BASE}/${GODOT_VERSION}/${BIN}.zip"
           echo "${GODOT_SHA256_LINUX_ZIP}  godot.zip" | sha256sum -c -
           unzip -q godot.zip
-          chmod +x "Godot_v${GODOT_VERSION}-stable_linux.x86_64"
-          echo "GODOT_EDITOR_BINARY=$PWD/Godot_v${GODOT_VERSION}-stable_linux.x86_64" >> "$GITHUB_ENV"
+          chmod +x "$BIN"
+          echo "GODOT_EDITOR_BINARY=$PWD/$BIN" >> "$GITHUB_ENV"
       - name: Install xvfb
         run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
       - name: Start Xvfb

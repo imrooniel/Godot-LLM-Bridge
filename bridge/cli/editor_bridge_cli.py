@@ -507,7 +507,7 @@ class EditorBridgeClient:
                     "binary path",
                     "or write the binary path to %s in the project root"
                     % BINARY_CONFIG,
-                    "or install Godot 4.7+ and put it on PATH (see "
+                    "or install Godot 4.8+ and put it on PATH (see "
                     "CONTRIBUTING dev setup)",
                 ])
 
