@@ -10,6 +10,15 @@ Open-source Community Edition release. `VERSION` at the repo root is the
 single source of truth for versioning; `scripts/check_version.py` (and CI)
 verify both `bridge/*/plugin.cfg` files match it.
 
+### Added — community infrastructure
+
+- CI: CLI test matrix (ubuntu/windows × Python 3.11/3.12), GDScript suite on
+  a checksum-pinned official Godot (4.7.2-stable), and an xvfb integration
+  job that drives the real editor + game end-to-end; issue + PR templates.
+- README rewritten as the stranger install path: requirements table
+  (4.7+ core / 4.8+ for DAP, Windows + Linux), exact install snippets,
+  OpenCode skills section, first-session walkthrough, troubleshooting table.
+
 ### Added — S-series (upstreamed from MergingWorlds)
 
 - `recover` command: one-shot bridge self-heal that gathers live state,
