@@ -754,5 +754,99 @@ class TestLaunchVersionGate(unittest.TestCase):
         self.assertIsNone(cp.probe_godot_version("/nope", runner=boom))
 
 
+class TestErrorSurfaceGuarantee(unittest.TestCase):
+    """Task 15: every non-zero CLI exit prints `Error [<class>]:` + a
+    `suggested:` line on stderr, and never a bare traceback. Subprocess
+    tests only — no Godot, no live editor.
+
+    Ruled exception (R16): `doctor` communicates via its own structured
+    output; its exit 1 means 'diagnosis found FAILs', not 'invocation
+    error' (like grep/test-runners). Pinned below.
+    """
+
+    CLI = os.path.join(os.path.dirname(__file__), "..", "cli",
+                       "editor_bridge_cli.py")
+
+    def _env(self, **over):
+        env = dict(os.environ)
+        env.pop("GODOT_EDITOR_BINARY", None)
+        env.update({k: v for k, v in over.items() if v is not None})
+        return env
+
+    def _run(self, *argv, cwd=None, env=None):
+        return subprocess.run([sys.executable, self.CLI] + list(argv),
+                              capture_output=True, text=True, timeout=30,
+                              cwd=cwd or os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                              env=env or self._env())
+
+    def _assert_clean_error(self, proc):
+        self.assertIn(proc.returncode, (1, 2),
+                      "exit=%s out=%r err=%r" % (proc.returncode, proc.stdout, proc.stderr))
+        self.assertIn("Error [", proc.stderr,
+                      "stderr lacked 'Error [': %r" % proc.stderr)
+        self.assertIn("suggested:", proc.stderr,
+                      "stderr lacked a suggested: line: %r" % proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("Traceback", proc.stdout)
+
+    def test_unknown_command(self):
+        self._assert_clean_error(self._run("frobnicate-the-bridge"))
+
+    def test_missing_required_args(self):
+        self._assert_clean_error(self._run("game", "get", "Some/Node"))
+
+    def test_bad_json_params(self):
+        self._assert_clean_error(
+            self._run("game", "rpc", "anything", "--json-params", "{not json"))
+
+    def test_game_command_without_editor(self):
+        # The community worktree has no editor on its mailbox in CI.
+        proc = self._run("game", "scene-info")
+        self.assertIn(proc.returncode, (1, 2))
+        self.assertIn("Error [", proc.stderr, proc.stderr)
+        self.assertIn("suggested:", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_launch_outside_project(self):
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            shutil.copy(self.CLI, os.path.join(tmp, "cli_x.py"))
+            shutil.copy(os.path.join(os.path.dirname(self.CLI), "cli_proc.py"),
+                        tmp)
+            proc = subprocess.run([sys.executable, os.path.join(tmp, "cli_x.py"),
+                                   "launch"],
+                                  capture_output=True, text=True, timeout=30,
+                                  env=self._env())
+            self._assert_clean_error(proc)
+            self.assertIn("bad_project", proc.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_launch_old_engine_classed(self):
+        import tempfile
+        fake = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+        fake.write("#!/bin/sh\necho '3.5.1.stable.official'\n")
+        fake.close()
+        os.chmod(fake.name, 0o755)
+        try:
+            proc = self._run("launch", env=self._env(GODOT_EDITOR_BINARY=fake.name))
+            self._assert_clean_error(proc)
+            self.assertIn("godot_version", proc.stderr)
+        finally:
+            os.unlink(fake.name)
+
+    def test_doctor_exception_to_rule(self):
+        # doctor's exit 1 is a RESULT, not an invocation error: no Error [ on
+        # stderr, structured checks on stdout, never a traceback.
+        proc = self._run("doctor", "--path", "/no/such/dir/xyzzy", "--json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("Error [", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertFalse(payload["ok"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
