@@ -2,7 +2,7 @@
 extends RefCounted
 
 ## query.scene — metadata for a scene path (open status or resource info).
-## Args: {"path": "res://scenes/combat.tscn"}
+## Args: {"path": "res://scenes/main.tscn"}
 
 func execute(args: Dictionary, ctx) -> Dictionary:
 	var path: String = str(args.get("path", ""))

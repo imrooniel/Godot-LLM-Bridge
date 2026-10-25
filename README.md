@@ -89,4 +89,4 @@ python bridge/cli/editor_bridge_cli.py game godot-status
 
 ## 📄 License
 
-MIT License
+Released under the [MIT License](LICENSE).

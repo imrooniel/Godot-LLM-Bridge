@@ -1,6 +1,6 @@
 ---
 name: human-edit
-description: Read what the HUMAN edited in the Godot editor since your last turn (content deltas: node add/remove/rename, property changes, scene saves). Use at the START of each turn so you work from a current picture, not a stale one. Trigger keywords: human-deltas, human edit, what did the human change, content deltas, turn start.
+description: Use when you need to read what the HUMAN edited in the Godot editor since your last turn (content deltas: node add/remove/rename, property changes, scene saves). Use at the START of each turn so you work from a current picture, not a stale one. Trigger keywords: human-deltas, human edit, what did the human change, content deltas, turn start.
 ---
 
 # Human-Edit Deltas

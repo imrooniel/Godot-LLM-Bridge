@@ -43,8 +43,32 @@ var emit_event: Callable = func(_e: String, _d: Dictionary) -> void: pass
 var respond: Callable = func(_i: String, _r: Dictionary) -> void: pass
 
 
-func make_error(code: int, message: String) -> Dictionary:
-	return {"ok": false, "error": {"code": code, "message": message}}
+func make_error(code: int, message: String, reason: String = "",
+		suggested: Array = []) -> Dictionary:
+	var e := {"ok": false, "error": {"code": code, "message": message}}
+	if reason != "":
+		e["error"]["reason"] = reason
+	if not suggested.is_empty():
+		e["error"]["suggested"] = suggested
+	return e
+
+
+## Returns the DAP client, or an error Dictionary if not initialized.
+func require_dap() -> Variant:
+	if dap == null:
+		return make_error(-32603, "DAP session not initialized (4.8+ engine required)")
+	return dap
+
+
+## Returns the DAP client, or an error Dictionary if not initialized OR not attached.
+func require_dap_attached() -> Variant:
+	var dap_or_err: Variant = require_dap()
+	if dap_or_err is Dictionary:
+		return dap_or_err
+	var dap = dap_or_err
+	if not dap.attached:
+		return make_error(-32002, "Not attached (run `debugger attach` first)")
+	return dap
 
 
 func get_editor() -> Dictionary:

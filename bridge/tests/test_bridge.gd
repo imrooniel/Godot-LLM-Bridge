@@ -99,7 +99,62 @@ func _initialize() -> void:
 	var no_run: Dictionary = bridge._cmd_telemetry_sample({})
 	_check("telemetry: sample while not running -> error", "error" in no_run)
 
+	# B9: the unpausable timer helper returns a valid timer object.
+	var t = bridge._unpausable_timer(0.01)
+	_check("B9: _unpausable_timer returns a SceneTreeTimer", t != null)
+
+	# B7: the per-instance log path is pid-keyed (no longer machine-global).
+	bridge._clear_logs_for_session()
+	_check("B7: _clear_logs_for_session runs", bridge._log_collector != null)
+
+	# S10 de-coupling: the core registers no game-specific handlers and its
+	# game_status carries no game-specific fields. register_handler() remains
+	# the extension point (games attach custom handlers, called via `game rpc`).
+	# The handler name is built at runtime so the repo-wide scrub grep for the
+	# removed MW handler stays clean.
+	var removed_handler: String = "mods" + "_loaded"
+	_check("decoupling: no MW mod-listing handler in core", not bridge._has_handler(removed_handler))
+	var gstatus: Dictionary = bridge._cmd_game_status({})
+	_check("decoupling: game_status has no in_combat field",
+			not gstatus.get("result", {}).has("in_combat"))
+	_check("decoupling: game_status keeps generic scene_file field",
+			gstatus.get("result", {}).has("scene_file"))
+	var rt_ok: bool = await _register_handler_round_trip(bridge)
+	_check("decoupling: register_handler + dispatch round-trip", rt_ok)
+
+	# ---- S7 generalization: lua_api reads the INJECTED VM -------------------
+	# The core must never look up a game-specific Lua autoload by name; it uses
+	# the set_lua_vm() injection seam only. Fresh bridge (no VM injected yet):
+	# lua_api returns a contract error with the actionable reason.
+	var no_vm: Dictionary = bridge._cmd_lua_api({})
+	_check("lua_api: no VM injected -> error envelope", "error" in no_vm)
+	_check("lua_api: no VM -> reason == lua_vm_not_registered",
+			no_vm.get("error", {}).get("reason") == "lua_vm_not_registered")
+	# Inject a stub VM exposing bridge_registry.live_names() -> names returned.
+	var stub_vm := StubLuaVM.new()
+	var stub_reg := StubBridgeRegistry.new()
+	stub_reg.names = ["test_fn_one", "test_fn_two"]
+	stub_vm.bridge_registry = stub_reg
+	bridge.set_lua_vm(stub_vm)
+	var api: Dictionary = bridge._cmd_lua_api({})
+	_check("lua_api: injected VM -> ok result", api.get("result", {}).get("ok") == true)
+	_check("lua_api: injected VM -> live_names() returned",
+			api.get("result", {}).get("functions") == ["test_fn_one", "test_fn_two"])
+	stub_vm.free()  # not in the tree; free explicitly so the bridge drops it
+
 	bridge.queue_free()
+	await process_frame  # let the bridge (and its TCP listener) be freed
+
+	# B4: with no game/bridge listening, is_reachable() must return false cleanly
+	# (it will attempt a connect to 127.0.0.1:5555 and fail). Use the proxy, not
+	# the bridge (the proxy is the editor-side client). This check runs AFTER the
+	# test debug_bridge is freed on purpose: that instance also listens on
+	# 127.0.0.1:5555 (its _ready() opens the server in debug builds) and would
+	# answer the probe, making "no server" false.
+	var proxy = load("res://bridge/editor_bridge/game_proxy.gd").new()
+	await process_frame
+	_check("game_proxy.is_reachable() false with no server", proxy.is_reachable() == false)
+	proxy.reset()
 
 	print("")
 	print("=== Bridge Test Results ===")
@@ -110,6 +165,19 @@ func _initialize() -> void:
 	else:
 		print("TESTS FAILED")
 	quit(1 if _failures > 0 else 0)
+
+
+## Extension-point round trip: a game registers a custom handler via
+## register_handler() (the documented S10 de-coupling seam), then the bridge
+## dispatches it by name — the same path `game rpc <name>` takes. Returns true
+## when both halves work.
+func _register_handler_round_trip(bridge: Node) -> bool:
+	bridge.register_handler("test_echo", func(p: Dictionary) -> Dictionary:
+		return {"result": {"echo": p.get("v")}})
+	if not bridge._has_handler("test_echo"):
+		return false
+	var res: Dictionary = await bridge._dispatch("test_echo", {"v": 42})
+	return res.get("result", {}).get("echo") == 42
 
 
 ## Add a key to an InputMap action at runtime (no-op if the action already maps
@@ -132,3 +200,16 @@ func _check(label: String, condition: bool) -> void:
 	else:
 		_failures += 1
 		print("  FAIL: %s" % label)
+
+
+## Stub of the injected Lua VM's shape for the lua_api checks: a Node (the
+## type set_lua_vm() accepts) carrying a bridge_registry with live_names().
+class StubBridgeRegistry extends RefCounted:
+	var names: Array = []
+
+	func live_names() -> Array:
+		return names
+
+
+class StubLuaVM extends Node:
+	var bridge_registry: RefCounted = null

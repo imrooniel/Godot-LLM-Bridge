@@ -2,7 +2,7 @@
 extends RefCounted
 
 ## query.scene.tree — node tree of an OPEN scene.
-## Args: {"path": "res://scenes/combat.tscn", "depth": 3}
+## Args: {"path": "res://scenes/main.tscn", "depth": 3}
 
 func execute(args: Dictionary, ctx) -> Dictionary:
 	var path: String = str(args.get("path", ""))

@@ -13,11 +13,10 @@ extends RefCounted
 ## Async in both modes (variable data may arrive from the debuggee late).
 
 func execute(args: Dictionary, ctx) -> Variant:
-	var dap = ctx.dap
-	if dap == null:
-		return ctx.make_error(-32603, "DAP session not initialized (4.8+ engine required)")
-	if not dap.attached:
-		return ctx.make_error(-32002, "Not attached (run `debugger attach` first)")
+	var dap_or_err: Variant = ctx.require_dap_attached()
+	if dap_or_err is Dictionary:
+		return dap_or_err
+	var dap = dap_or_err
 	dap.wake()
 	if int(args.get("ref", 0)) > 0:
 		if not dap.enqueue(ctx.current_request_id, "variables",

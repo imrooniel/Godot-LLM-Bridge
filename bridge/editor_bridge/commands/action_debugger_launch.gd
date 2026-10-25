@@ -7,9 +7,10 @@ extends RefCounted
 ## Async: responds when the launch handshake completes (game starting).
 
 func execute(args: Dictionary, ctx) -> Variant:
-	var dap = ctx.dap
-	if dap == null:
-		return ctx.make_error(-32603, "DAP session not initialized (4.8+ engine required)")
+	var dap_or_err: Variant = ctx.require_dap()
+	if dap_or_err is Dictionary:
+		return dap_or_err
+	var dap = dap_or_err
 	if dap.attached:
 		return ctx.make_error(-32002, "Already attached — stop the game first (`action scene-stop`)")
 	var scene: String = str(args.get("scene", ""))

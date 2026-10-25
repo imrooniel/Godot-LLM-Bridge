@@ -32,6 +32,11 @@ res://bridge/human_edit/plugin.cfg
 See `game/GUIDE.md`. The short version: define an `[input]` action map, OR `DebugBridge.is_action_held`
 with `Input.is_action_held` in your movement code, and expose a state-hub autoload the LLM can read.
 
+## Custom handlers (extension point)
+The core registers only generic, game-agnostic handlers. Your game adds its own commands by calling
+`DebugBridge.register_handler(name, callback)` (e.g. from an autoload's `_ready()`), then calls them
+with `python3 bridge/cli/editor_bridge_cli.py game rpc <name> [--params '{...}']`.
+
 ## Run the self-tests
 ```
 godot --path <repo> --headless --check-only --script res://bridge/autoloads/debug_bridge.gd

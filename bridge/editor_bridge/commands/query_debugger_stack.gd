@@ -7,11 +7,10 @@ extends RefCounted
 ## Returns body: {"stackFrames": [{id, name, line, column, source: {path}}]}
 
 func execute(_args: Dictionary, ctx) -> Variant:
-	var dap = ctx.dap
-	if dap == null:
-		return ctx.make_error(-32603, "DAP session not initialized (4.8+ engine required)")
-	if not dap.attached:
-		return ctx.make_error(-32002, "Not attached (run `debugger attach` first)")
+	var dap_or_err: Variant = ctx.require_dap_attached()
+	if dap_or_err is Dictionary:
+		return dap_or_err
+	var dap = dap_or_err
 	dap.wake()
 	if not dap.enqueue(ctx.current_request_id, "stackTrace", {"threadId": 1}):
 		return ctx.make_error(-32000, "DAP not connected")

@@ -6,7 +6,8 @@ extends RefCounted
 ##          breakpoint_count, pending_requests, output_lines_buffered.
 
 func execute(_args: Dictionary, ctx) -> Dictionary:
-	var dap = ctx.dap
-	if dap == null:
-		return ctx.make_error(-32603, "DAP session not initialized (4.8+ engine required)")
+	var dap_or_err: Variant = ctx.require_dap()
+	if dap_or_err is Dictionary:
+		return dap_or_err
+	var dap = dap_or_err
 	return dap.get_state()
