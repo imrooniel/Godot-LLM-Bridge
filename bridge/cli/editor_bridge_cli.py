@@ -33,6 +33,7 @@ import glob
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -1111,6 +1112,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="One-shot self-heal: relaunch editor / kill orphan / replay scene / "
              "continue a breaked game — report a single status")
     subparsers.add_parser("ping", help="Check editor liveness (heartbeat)")
+    parser_doc = subparsers.add_parser(
+        "doctor",
+        help="Setup health check: install, registration, Godot binary, "
+             "editor liveness — with actionable fixes (works with no editor running)")
+    parser_doc.add_argument("--path", default=".",
+                            help="project directory to check (default: cwd)")
+    parser_doc.add_argument("--json", dest="as_json", action="store_true",
+                            help="machine-readable {ok, checks} output")
     subparsers.add_parser("connect", help="Verify the editor is reachable, print state")
 
     q = subparsers.add_parser("query")
@@ -1404,6 +1413,118 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _doctor_read_project(proj: str):
+    """Static read of <proj>/project.godot.
+
+    Returns (exists, features_version, autoload_lines, plugin_lines).
+    """
+    path = os.path.join(proj, "project.godot")
+    if not os.path.isfile(path):
+        return False, "", [], []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False, "", [], []
+    section = ""
+    features = ""
+    autoload, plugins = [], []
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1]
+            continue
+        if section == "application" and s.startswith("config/features="):
+            m = re.search(r"(\d+\.\d+)", s)
+            if m:
+                features = m.group(1)
+        elif section == "autoload":
+            autoload.append(line)
+        elif section == "editor_plugins":
+            plugins.append(line)
+    return True, features, autoload, plugins
+
+
+def _doctor_heartbeat_age(proj: str):
+    """Editor heartbeat age in seconds for <proj> (None if no state.json)."""
+    try:
+        with open(os.path.join(proj, ".tmp", "bridge", "state.json")) as f:
+            data = json.load(f)
+        return max(time.time() - data.get("heartbeat_ms", 0) / 1000.0, 0.0)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _doctor_godot_version(proj: str):
+    """Version string of the discoverable Godot binary for <proj>, or None.
+
+    Discovery order matches _find_godot_binary (env → per-project
+    .godot-editor-path → PATH), but reads the TARGET project's config file,
+    not the CLI install's.
+    """
+    binp = None
+    env = os.environ.get("GODOT_EDITOR_BINARY")
+    if env and os.path.exists(env):
+        binp = env
+    if binp is None:
+        try:
+            with open(os.path.join(proj, ".godot-editor-path")) as f:
+                cfg = f.read().strip().strip('"').strip("'")
+            if cfg:
+                cfg = cfg if os.path.isabs(cfg) else os.path.join(proj, cfg)
+                if os.path.exists(cfg):
+                    binp = cfg
+        except OSError:
+            pass
+    if binp is None:
+        import shutil
+        for name in ("godot", "godot4", "Godot", "godot-editor"):
+            found = shutil.which(name)
+            if found:
+                binp = found
+                break
+    if binp is None:
+        return None
+    try:
+        out = subprocess.run([binp, "--version"], capture_output=True,
+                             text=True, timeout=15)
+        lines = (out.stdout or "").strip().splitlines()
+        return lines[-1] if lines else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def run_doctor(project_path: str, as_json: bool) -> int:
+    """`doctor`: static setup diagnosis. Exit 0 iff no check failed."""
+    proj = os.path.abspath(project_path)
+    exists, features, autoload, plugins = _doctor_read_project(proj)
+    checks = cli_proc.doctor_evaluate(
+        project_exists=exists,
+        features=features,
+        autoload_lines=autoload,
+        plugin_lines=plugins,
+        python_version=tuple(sys.version_info[:2]),
+        godot_version_out=_doctor_godot_version(proj),
+        heartbeat_age_s=_doctor_heartbeat_age(proj),
+        os_name=platform.system(),
+    )
+    ok = not any(c["status"] == "fail" for c in checks)
+    if as_json:
+        print(json.dumps({"ok": ok, "checks": checks}, indent=2))
+    else:
+        icon = {"ok": "[ok]  ", "warn": "[warn]", "fail": "[FAIL]"}
+        print("doctor: %s  (%s)"
+              % ("healthy" if ok else "problems found", proj))
+        for c in checks:
+            print("%s %-22s %s" % (icon[c["status"]], c["name"], c["detail"]))
+            if c["fix"] and c["status"] != "ok":
+                print("        fix: %s" % c["fix"])
+        if not ok:
+            print("\nFix the [FAIL] items above; [warn] items are "
+                  "informational. Re-run doctor to confirm.")
+    return 0 if ok else 1
+
+
 def main() -> None:
     args = build_parser().parse_args()
     # `logs` with no subcommand word defaults to "get" (fetch). An optional
@@ -1411,6 +1532,9 @@ def main() -> None:
     # dispatch block below simple (dogfood BD-014).
     if args.command == "logs" and args.log_type is None:
         args.log_type = "get"
+    if args.command == "doctor":
+        # Static diagnosis by design: runs with no editor, no mailbox I/O.
+        sys.exit(run_doctor(args.path, args.as_json))
     client = EditorBridgeClient()
     _GLOBAL_CLIENT = client
 

@@ -12,6 +12,11 @@ verify both `bridge/*/plugin.cfg` files match it.
 
 ### Added — community infrastructure
 
+- `doctor` command: static setup diagnosis (project file, Godot feature
+  floor 4.7+/4.8-for-DAP, Python floor, Godot binary discovery, autoload +
+  plugin registration, editor heartbeat, OS support) with an actionable
+  `fix:` per failure; `--json` envelope; exit 0 iff no FAIL — the
+  troubleshooting entry point referenced by the README and issue templates.
 - CI: CLI test matrix (ubuntu/windows × Python 3.11/3.12), GDScript suite on
   a checksum-pinned official Godot (4.7.2-stable), and an xvfb integration
   job that drives the real editor + game end-to-end; issue + PR templates.

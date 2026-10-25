@@ -295,3 +295,142 @@ def suite_marker(result) -> str:
     if isinstance(result.get("fail"), int) and result["fail"] != 0:
         return "INCOMPLETE"
     return "TRUSTWORTHY"
+
+
+# ---------------------------------------------------------------------------
+# doctor — pure setup diagnosis
+# ---------------------------------------------------------------------------
+
+# Godot version floors (keep in sync with README requirements table and CI):
+# core bridge features are CI-gated on 4.7; DAP commands need engine 4.8+.
+DOCTOR_MIN_GODOT = (4, 7)
+DOCTOR_DAP_GODOT = (4, 8)
+
+
+def _parse_ver(s):
+    """'4.7' / '4.8.dev' -> (4, 7); anything unparseable -> None."""
+    try:
+        parts = str(s).strip().split(".")
+        return (int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return None
+
+
+def doctor_evaluate(project_exists, features, autoload_lines, plugin_lines,
+                    python_version, godot_version_out, heartbeat_age_s,
+                    os_name):
+    """Diagnose a bridge install from static facts only (no live editor).
+
+    Returns a list of Check dicts: {name, status: ok|fail|warn, detail, fix}.
+    `fix` is None for passing checks. Exit code policy lives in the CLI:
+    0 iff no check has status 'fail'.
+
+    Pure: all inputs are plain values so this is fully unit-testable.
+    """
+    checks = []
+
+    def add(name, status, detail, fix=None):
+        checks.append({"name": name, "status": status, "detail": detail,
+                       "fix": fix})
+
+    if not project_exists:
+        add("project_godot", "fail",
+            "no project.godot in this directory",
+            "Run the doctor from your Godot project root (the directory "
+            "containing project.godot), or pass --path /to/your/project.")
+        return checks
+    add("project_godot", "ok", "project.godot found")
+
+    # Godot feature floor (README: 4.7+ core, 4.8+ for DAP commands).
+    ver = _parse_ver(features)
+    if ver is None:
+        add("godot_features", "warn",
+            "could not read config/features from project.godot",
+            "Open the project once in Godot 4.7+ so project.godot is saved.")
+    elif ver < DOCTOR_MIN_GODOT:
+        add("godot_features", "fail",
+            "project features say Godot %d.%d — below the supported floor"
+            % ver,
+            "Open and save the project with Godot >= %d.%d (see README "
+            "Requirements)." % DOCTOR_MIN_GODOT)
+    elif ver < DOCTOR_DAP_GODOT:
+        add("godot_features", "warn",
+            "Godot %d.%d project: core bridge works, but `debugger ...` "
+            "commands need the 4.8+ engine DAP server" % ver,
+            "For DAP commands, open the project with Godot >= 4.8.")
+    else:
+        add("godot_features", "ok", "Godot %d.%d+ features" % ver)
+
+    # Python floor (bridge/cli is stdlib-only, >= 3.9).
+    if tuple(python_version) < (3, 9):
+        add("python_version", "fail",
+            "Python %s < 3.9" % ".".join(str(p) for p in python_version),
+            "Run the CLI with Python 3.9+ (e.g. `python3.11 bridge/cli/"
+            "editor_bridge_cli.py ...`); CI is tested on 3.11/3.12.")
+    else:
+        add("python_version", "ok",
+            "Python %s" % ".".join(str(p) for p in python_version))
+
+    # Godot binary discovery (needed for `launch`/`restart`).
+    if godot_version_out is None:
+        add("godot_binary", "fail",
+            "no Godot binary found (launch/restart would not work)",
+            "Set GODOT_EDITOR_BINARY, or write the binary path to a "
+            ".godot-editor-path file in your project root, or put godot on "
+            "PATH (see CONTRIBUTING dev setup).")
+    else:
+        add("godot_binary", "ok", "Godot binary answers: %s"
+            % str(godot_version_out).strip())
+
+    # Autoload registration.
+    joined = "\n".join(autoload_lines)
+    if "DebugBridge=" in joined:
+        add("autoload_debug_bridge", "ok", "DebugBridge autoload registered")
+    else:
+        add("autoload_debug_bridge", "fail",
+            "DebugBridge autoload missing from project.godot [autoload]",
+            "Add to project.godot [autoload]: "
+            'DebugBridge="*res://bridge/autoloads/debug_bridge.gd"')
+
+    # Editor plugins (both must be enabled).
+    plugins_blob = "\n".join(plugin_lines)
+    needed = ["res://bridge/editor_bridge/plugin.cfg",
+              "res://bridge/human_edit/plugin.cfg"]
+    missing = [p for p in needed if p not in plugins_blob]
+    if not missing:
+        add("editor_plugins", "ok", "both editor plugins enabled")
+    else:
+        add("editor_plugins", "fail",
+            "missing plugin entries: %s" % ", ".join(missing),
+            "Set in project.godot: enabled=PackedStringArray("
+            '"res://bridge/editor_bridge/plugin.cfg", '
+            '"res://bridge/human_edit/plugin.cfg") '
+            "(or enable Editor Bridge + HumanEdit under "
+            "Project Settings -> Plugins)")
+
+    # Editor liveness — warn only: the doctor works with no editor running.
+    if heartbeat_age_s is None:
+        add("editor_heartbeat", "warn",
+            "no editor heartbeat (state.json missing) — editor not running?",
+            "Start the editor through the CLI: `... editor_bridge_cli.py "
+            "launch` (this is fine if you only wanted a setup check).")
+    elif heartbeat_age_s > 2.0:
+        add("editor_heartbeat", "warn",
+            "editor heartbeat stale (%.1fs old) — editor closed or busy?"
+            % heartbeat_age_s,
+            "Check `query state`; then `recover` once, or `launch` a fresh "
+            "editor.")
+    else:
+        add("editor_heartbeat", "ok",
+            "editor heartbeat fresh (%.1fs)" % heartbeat_age_s)
+
+    # OS support statement (macOS untested).
+    if os_name == "Darwin":
+        add("os_support", "warn",
+            "macOS is not an officially supported platform (untested)",
+            "It generally works — but file issues with details, and expect "
+            "Linux/Windows to be validated first.")
+    else:
+        add("os_support", "ok", "%s is supported" % os_name)
+
+    return checks
