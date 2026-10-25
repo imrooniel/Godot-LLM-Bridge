@@ -684,10 +684,16 @@ class EditorBridgeClient:
             resolved = os.path.join(PROJECT_ROOT, resolved[len("res://"):])
         elif not os.path.isabs(resolved):
             resolved = os.path.join(PROJECT_ROOT, resolved)
-        if not os.path.exists(resolved):
+        # Gate on isfile, not exists: a directory or other non-regular path is
+        # missing-for-our-purposes — opening it would raise a misleading OS
+        # error that the parse handler below must never absorb.
+        if not os.path.isfile(resolved):
+            detail = ("exists but is not a regular file"
+                      if os.path.exists(resolved) else "not found")
             return _contract_err(
                 {"error": {"code": -32000,
-                           "message": "suite result file not found: %s" % resolved}},
+                           "message": "suite result file %s: %s"
+                                      % (detail, resolved)}},
                 _current_state(), "suite_result_missing",
                 suggested=["re-run the test suite (the harness persists the "
                            "result file)",
@@ -696,15 +702,27 @@ class EditorBridgeClient:
         try:
             with open(resolved) as f:
                 data = json.load(f)
-        except (OSError, ValueError) as e:
-            # ValueError covers json.JSONDecodeError — a corrupt/partial file
-            # must surface as a contract envelope, never a bare traceback.
+        except ValueError as e:
+            # ValueError covers json.JSONDecodeError (and UnicodeDecodeError) —
+            # a corrupt/partial file must surface as a contract envelope,
+            # never a bare traceback.
             return _contract_err(
                 {"error": {"code": -32000,
                            "message": "suite result file is not valid JSON: %s (%s)"
                                       % (resolved, e)}},
                 _current_state(), "suite_result_unreadable",
                 suggested=["re-run the test suite to rewrite the result file"])
+        except OSError as e:
+            # A path that passed isfile but fails to OPEN (permissions, or an
+            # isfile-race where it became a directory): report the OS failure
+            # accurately, never a bogus "is not valid JSON".
+            return _contract_err(
+                {"error": {"code": -32000,
+                           "message": "suite result file could not be read: %s (%s)"
+                                      % (resolved, e)}},
+                _current_state(), "suite_result_unreadable",
+                suggested=["check the file's permissions",
+                           "re-run the test suite to rewrite the result file"])
         return {"ok": True, "state": _current_state(), "result": data,
                 "marker": cli_proc.suite_marker(data)}
 

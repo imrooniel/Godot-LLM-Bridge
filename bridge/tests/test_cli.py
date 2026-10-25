@@ -428,6 +428,44 @@ class TestSuiteResultPath(unittest.TestCase):
         res = self.client.suite_result(path)
         self.assertFalse(res["ok"])
         self.assertEqual(res["error"]["reason"], "suite_result_unreadable")
+        self.assertIn(path, res["error"]["message"])
+        self.assertIn("not valid JSON", res["error"]["message"])
+
+    def test_suite_result_directory_reports_missing_not_bad_json(self):
+        # A directory (e.g. `--path .` -> project root) is missing-for-our-
+        # purposes: reason stays suite_result_missing and the message must NOT
+        # claim a JSON parse error (the failure is IsADirectoryError).
+        d = self._tmpdir()
+        res = self.client.suite_result(d)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["reason"], "suite_result_missing")
+        self.assertIn(d, res["error"]["message"])
+        self.assertIn("not a regular file", res["error"]["message"])
+        self.assertNotIn("JSON", res["error"]["message"])
+
+    def test_suite_result_os_error_on_read_reports_accurately(self):
+        # A real file that fails to OPEN (permissions here) must report the OS
+        # failure, never "is not valid JSON". Skipped where permissions are
+        # not enforced (root) or the platform is unreliable (non-POSIX).
+        import errno
+        path = self._write(self._tmpdir(), "suite.json",
+                           json.dumps({"ok": True, "fail": 0}))
+        if os.name != "posix":
+            self.skipTest("chmod-based permission denial is POSIX-only")
+        os.chmod(path, 0o000)
+        try:
+            try:  # probe: root (or a lax fs) can still open 0o000 files
+                open(path).close()
+                self.skipTest("permissions not enforced for this user (root?)")
+            except OSError as probe:
+                self.assertEqual(probe.errno, errno.EACCES)
+            res = self.client.suite_result(path)
+        finally:
+            os.chmod(path, 0o600)  # keep tearDown's rmtree/collect happy
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["reason"], "suite_result_unreadable")
+        self.assertIn("could not be read", res["error"]["message"])
+        self.assertNotIn("JSON", res["error"]["message"])
 
     # -- path forms ----------------------------------------------------------
     def test_suite_result_relative_and_res_scheme_anchor_project_root(self):
