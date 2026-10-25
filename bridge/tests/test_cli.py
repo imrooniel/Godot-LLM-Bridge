@@ -683,5 +683,76 @@ class TestDoctorCliWiring(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestLaunchVersionGate(unittest.TestCase):
+    """launch must refuse Godot below the supported floor (4.7 core floor
+    per CI pin/R13-R14; `minimum` parameterizable so the floor can rise to
+    4.8 when 4.8-stable ships)."""
+
+    def test_parse_stable(self):
+        self.assertEqual(cp.parse_godot_version("4.8.stable.official.abc\n"),
+                         (4, 8))
+
+    def test_parse_dev_custom(self):
+        self.assertEqual(cp.parse_godot_version("4.8.dev.custom_build.34d0"),
+                         (4, 8))
+        self.assertEqual(cp.parse_godot_version("4.7.2.stable.official.ed1"),
+                         (4, 7))
+
+    def test_parse_garbage(self):
+        self.assertIsNone(cp.parse_godot_version("not a version"))
+        self.assertIsNone(cp.parse_godot_version(""))
+        self.assertIsNone(cp.parse_godot_version(None))
+
+    def test_supported(self):
+        self.assertTrue(cp.godot_version_supported((4, 7)))
+        self.assertTrue(cp.godot_version_supported((4, 8)))
+        self.assertTrue(cp.godot_version_supported((5, 0)))
+        self.assertFalse(cp.godot_version_supported((4, 6)))
+        self.assertFalse(cp.godot_version_supported((4, 7), minimum=(4, 8)))
+        self.assertFalse(cp.godot_version_supported(None))
+
+    def test_gate_passes_supported(self):
+        self.assertIsNone(cp.launch_version_gate("4.7.2.stable.official.x"))
+        self.assertIsNone(cp.launch_version_gate("4.8.dev.custom_build"))
+
+    def test_gate_refuses_old(self):
+        g = cp.launch_version_gate("4.5.1.stable.official")
+        self.assertIsNotNone(g)
+        self.assertEqual(g["reason"], "godot_version")
+        self.assertIn("4.5", g["message"])
+        self.assertIn("4.7", " ".join(g["suggested"]))
+        self.assertIn("https://godotengine.org", " ".join(g["suggested"]))
+        self.assertIn("GODOT_EDITOR_BINARY", " ".join(g["suggested"]))
+
+    def test_gate_unparseable_fails(self):
+        g = cp.launch_version_gate("SIGSEGV or garbage")
+        self.assertIsNotNone(g)
+        self.assertEqual(g["reason"], "godot_version")
+
+    def test_gate_minimum_override(self):
+        # 4.7 passes today's floor but would fail a raised 4.8 floor.
+        self.assertIsNone(cp.launch_version_gate("4.7.2.stable"))
+        self.assertIsNotNone(cp.launch_version_gate("4.7.2.stable",
+                                                    minimum=(4, 8)))
+
+    def test_probe_uses_injectable_runner(self):
+        seen = {}
+
+        def runner(cmd):
+            seen["cmd"] = cmd
+            return "4.7.2.stable.official.ed1daf0bf\n"
+
+        self.assertEqual(cp.probe_godot_version("/bin/godot", runner=runner),
+                         (4, 7))
+        self.assertEqual(seen["cmd"][0], "/bin/godot")
+        self.assertIn("--version", seen["cmd"])
+        self.assertIn("--headless", seen["cmd"])
+
+    def test_probe_runner_failure_is_none(self):
+        def boom(cmd):
+            raise OSError("no such binary")
+        self.assertIsNone(cp.probe_godot_version("/nope", runner=boom))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
