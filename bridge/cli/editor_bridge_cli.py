@@ -20,8 +20,8 @@ Usage:
     python3 bridge/cli/editor_bridge_cli.py launch                 # start editor
     python3 bridge/cli/editor_bridge_cli.py ping                   # liveness
     python3 bridge/cli/editor_bridge_cli.py query state            # full state
-    python3 bridge/cli/editor_bridge_cli.py action scene-open res://scenes/combat.tscn
-    python3 bridge/cli/editor_bridge_cli.py action scene-play --path res://scenes/combat.tscn
+    python3 bridge/cli/editor_bridge_cli.py action scene-open res://scenes/main.tscn
+    python3 bridge/cli/editor_bridge_cli.py action scene-play --path res://scenes/main.tscn
     python3 bridge/cli/editor_bridge_cli.py action scene-stop
     python3 bridge/cli/editor_bridge_cli.py subscribe listen       # stream events
     python3 bridge/cli/editor_bridge_cli.py logs get --source auto
@@ -1304,10 +1304,13 @@ def build_parser() -> argparse.ArgumentParser:
     gclick.add_argument("--button", type=int, default=1)
     gts = g_sub.add_parser("time-scale")
     gts.add_argument("scale", type=float)
-    gcs = g_sub.add_parser("change-scene", help="Change scene on the MAIN thread (runs combat._start_from_config)")
+    gcs = g_sub.add_parser("change-scene",
+                           help="Change the running game's scene on the MAIN thread "
+                                "(change_scene_to_file + bounded readiness ACK)")
     gcs.add_argument("path")
     grpc = g_sub.add_parser("rpc", help="Forward an arbitrary registered bridge method (core or game-registered)")
-    grpc.add_argument("method", help="Registered method name, e.g. combat_start_match, combat_snapshot, start_scene")
+    grpc.add_argument("method",
+                      help="Registered method name, e.g. query_game_state, scene_ready, game_status")
     grpc.add_argument("--json-params", dest="json_params", default="",
                       help="JSON object of named params, e.g. '{\"x\": 3}' "
                            "(alias: --params)")
@@ -1590,15 +1593,16 @@ def main() -> None:
                     args.json_params = ""
                 method = args.method
                 params = _parse_json_params(args.json_params)
-                # Combat ops (start_scene with its readiness poll, combat_start_match
-                # which loads a scene + waits for live, combat_step which waits for
-                # animation) can exceed the 30 s default; give rpc the slow-op budget
-                # (same as lua-eval) so a slow-but-valid op isn't killed early.
+                # Slow game ops (start_scene with its readiness poll, methods
+                # that load a scene and wait for it to go live, methods that
+                # wait on animation) can exceed the 30 s default; give rpc the
+                # slow-op budget (same as lua-eval) so a slow-but-valid op
+                # isn't killed early.
                 rpc_timeout = SLOW_GAME_OP_TIMEOUT
                 # B6: idempotency-gated retry for read-only registered methods.
-                # Writes (start_scene, combat_*, set_*) are NOT retried (double-apply risk).
-                read_only_rpc = method in {"combat_snapshot", "combat_ai_trace",
-                                           "query_game_state", "scene_ready",
+                # Writes (start_scene, scene/game action methods, set_*) are
+                # NOT retried (double-apply risk).
+                read_only_rpc = method in {"query_game_state", "scene_ready",
                                            "game_status", "ping"}
                 # honor --no-retry (the GAME_COMMANDS path does), otherwise this
                 # retry path ignores the flag.
