@@ -244,12 +244,8 @@ def _launch_preflight(project_path: str = None, force: bool = False) -> None:
     if force and procs["editors"]:
         # S6: a lingering editor is force-killed so `launch --force` never spawns
         # a second editor (which would corrupt the shared bridge mailbox).
-        import signal as _sig
         for pid, _ in procs["editors"]:
-            try:
-                os.kill(pid, _sig.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            cli_proc.kill_pid(pid)
         for _ in range(20):
             if all(not cli_proc.pid_alive(p) for p, _ in procs["editors"]):
                 break
@@ -257,12 +253,8 @@ def _launch_preflight(project_path: str = None, force: bool = False) -> None:
         print("Killed lingering editor(s): %s" % [p for p, _ in procs["editors"]],
               file=sys.stderr)
     if cli_proc.should_kill_orphans(procs, force):
-        import signal as _sig
         for pid, _ in procs["games"]:
-            try:
-                os.kill(pid, _sig.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            cli_proc.kill_pid(pid)
         print("Killed orphan game(s): %s" % [p for p, _ in procs["games"]],
               file=sys.stderr)
     elif procs["games"]:
@@ -670,11 +662,7 @@ class EditorBridgeClient:
                 if editor_pid and cli_proc.pid_alive(editor_pid):
                     print("Editor (pid %d) still alive 45s after the quit request — "
                           "force-killing it." % editor_pid, file=sys.stderr)
-                    import signal as _sig
-                    try:
-                        os.kill(editor_pid, _sig.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                    cli_proc.kill_pid(editor_pid)
                     for _ in range(20):
                         if not cli_proc.pid_alive(editor_pid):
                             break
@@ -729,11 +717,7 @@ class EditorBridgeClient:
                 orphan_pid = procs["games"][0][0]
         plan = cli_proc.recover_plan(editor_alive, running, bridge_up, breaked, orphan_pid)
         if plan["action"] == "kill_orphan":
-            import signal as _sig
-            try:
-                os.kill(plan["orphan_pid"], _sig.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            cli_proc.kill_pid(plan["orphan_pid"])
             plan["killed_pid"] = plan["orphan_pid"]
         elif plan["action"] == "replay_scene":
             self.rpc("action.scene.stop", {}, timeout=10)

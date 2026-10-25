@@ -91,12 +91,15 @@ def same_path(a: str, b: str) -> bool:
     return na == nb
 
 
-def find_godot_procs(project_path: str, ps_out: str = None, pid: int = None):
+def find_godot_procs(project_path: str, ps_out: str = None,
+                    pid: int = None, os_name: str = None,
+                    runner=None):
     """Return {"editors": [(pid, cmdline)], "games": [(pid, cmdline)]} for
     Godot processes whose `--path` targets `project_path`.
 
-    `ps_out`/`pid` are injectable for tests. When `ps_out` is None we run
-    `ps -eo pid=,args=`. Degrades to empty dicts on any ps failure (the CLI
+    `ps_out`/`pid`/`os_name`/`runner` are injectable for tests. When
+    `ps_out` is None we run `ps -eo pid=,args=` (posix) or the CIM CSV
+    command (Windows, via `runner`). Degrades to empty dicts on any ps failure (the CLI
     then proceeds without pre-flight, same as today).
 
     The fix for A2: editors and games are matched SEPARATELY and correctly
@@ -105,16 +108,23 @@ def find_godot_procs(project_path: str, ps_out: str = None, pid: int = None):
     truncated/other-project path does NOT falsely match, and a game process
     is no longer mistaken for an editor.
     """
+    is_nt = (os_name or os.name) == "nt"
     if ps_out is None:
         try:
-            ps_out = subprocess.run(["ps", "-eo", "pid=,args="],
-                                    capture_output=True, text=True, timeout=5).stdout
-        except (OSError, subprocess.SubprocessError):
+            if is_nt:
+                ps_out = (runner or _windows_run)(windows_ps_command())
+            else:
+                ps_out = subprocess.run(["ps", "-eo", "pid=,args="],
+                                        capture_output=True, text=True,
+                                        timeout=5).stdout
+        except Exception:
             return {"editors": [], "games": []}
     if pid is None:
         pid = os.getpid()
     editors, games = [], []
-    for p, cmdline in parse_ps(ps_out, pid):
+    entries = (parse_windows_procs(ps_out) if is_nt
+               else parse_ps(ps_out, pid))
+    for p, cmdline in entries:
         path = proc_path_arg(cmdline)
         if not same_path(path, project_path):
             continue
@@ -141,8 +151,11 @@ def should_kill_orphans(procs: dict, force: bool) -> bool:
     return force and bool(procs["games"])
 
 
-def pid_alive(pid: int) -> bool:
-    """True if `pid` is a live process on this host (signal-0 probe).
+def pid_alive(pid: int, runner=None, os_name=None) -> bool:
+    """True if `pid` is a live process on this host.
+
+    posix: signal-0 probe. Windows: the process list — os.kill(pid, 0)
+    there would TERMINATE it (non-CTRL signals map to TerminateProcess).
 
     This is the fix for C3: restart()'s death-wait must check PROCESS
     liveness, not the heartbeat age in state.json (a modal-blocked editor
@@ -150,6 +163,12 @@ def pid_alive(pid: int) -> bool:
     stale while still alive)."""
     if pid <= 0:
         return False
+    if pid_alive_impl(os_name or os.name) == "pid_list":
+        try:
+            text = (runner or _windows_run)(windows_ps_command())
+        except Exception:
+            return False
+        return any(p == pid for p, _ in parse_windows_procs(text))
     try:
         os.kill(pid, 0)
         return True
@@ -532,3 +551,99 @@ def launch_version_gate(version_text, minimum=LAUNCH_MIN_GODOT):
             "or a .godot-editor-path file (see CONTRIBUTING dev setup)",
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Windows process parity — ps/kill equivalents behind injectable seams
+# ---------------------------------------------------------------------------
+# On Windows there is no `ps`, and os.kill(pid, 0) TERMINATES the process
+# (any non-CTRL signal maps to TerminateProcess there). Every process probe
+# and kill therefore routes through these helpers, selected by os_name, with
+# an injectable `runner(cmd_list) -> str` (tests never spawn; unit tests run
+# on Linux with fixtures).
+
+import csv as _csv
+import io as _io
+import signal as _signal
+
+
+def windows_ps_command():
+    """Windows equivalent of `ps -eo pid=,args=` as a command list.
+
+    CIM carries full command lines (Win32_Process.CommandLine); CSV keeps
+    parse_windows_procs dead simple and quoting-correct for paths with spaces.
+    """
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId,CommandLine | ConvertTo-Csv "
+            "-NoTypeInformation"]
+
+
+def parse_windows_procs(csv_text):
+    """Parse ConvertTo-Csv output into [(pid:int, cmdline:str)].
+
+    Skips the header row, rows without an int pid, and empty text. A quoted
+    CommandLine containing spaces/commas survives intact (csv module).
+    """
+    if not csv_text:
+        return []
+    try:
+        rows = list(_csv.reader(_io.StringIO(csv_text)))
+    except _csv.Error:
+        return []
+    procs = []
+    for row in rows:
+        if len(row) < 2:
+            continue
+        pid_s, cmd = row[0], row[1]
+        if pid_s.strip().lower() == "processid":  # header
+            continue
+        try:
+            p = int(pid_s)
+        except ValueError:
+            continue
+        procs.append((p, cmd or ""))
+    return procs
+
+
+def _windows_run(cmd):
+    """Default Windows command runner: stdout text, bounded."""
+    out = subprocess.run(list(cmd), capture_output=True, text=True,
+                         timeout=15)
+    return out.stdout or ""
+
+
+def pid_alive_impl(os_name):
+    """Which liveness probe the platform must use.
+
+    'signal0'  — os.kill(pid, 0) (posix; safe there).
+    'pid_list' — consult the process list (Windows: os.kill would TERMINATE).
+    """
+    return "pid_list" if os_name == "nt" else "signal0"
+
+
+def kill_command(pid, os_name):
+    """Force-kill command list for the platform."""
+    if os_name == "nt":
+        return ["taskkill", "/PID", str(pid), "/F"]
+    return ["kill", "-9", str(pid)]
+
+
+def kill_pid(pid, runner=None, os_name=None):
+    """Force-kill a process platform-appropriately. Best-effort bool.
+
+    posix: os.kill(SIGKILL) — no subprocess needed.
+    Windows: taskkill /F via `runner` (default: subprocess).
+    """
+    os_name = os_name or os.name
+    if pid_alive_impl(os_name) == "signal0":
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            return True
+        except OSError:
+            return False
+    try:
+        (runner or _windows_run)(kill_command(pid, "nt"))
+        return True
+    except Exception:
+        return False

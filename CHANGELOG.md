@@ -12,6 +12,11 @@ verify both `bridge/*/plugin.cfg` files match it.
 
 ### Added — community infrastructure
 
+- Windows process parity in the CLI: process listing via PowerShell CIM
+  (`Get-CimInstance Win32_Process` → CSV), liveness via process-list lookup
+  (os.kill(pid, 0) TERMINATES on Windows — never signaled now), force-kills
+  via `taskkill /F`; all behind injectable runners, unit-tested on Linux
+  with fixtures. Owner smoke checklist added to docs/HUMAN_GUIDE.md.
 - Error-surface guarantee: every non-zero CLI exit now prints
   `Error [<class>]:` + at least one `suggested:` line — argparse usage errors
   (`bad_args`), editor-down, launch refusals (`bad_project`, `godot_binary`,
