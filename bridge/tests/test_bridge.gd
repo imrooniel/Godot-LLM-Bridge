@@ -122,6 +122,26 @@ func _initialize() -> void:
 	var rt_ok: bool = await _register_handler_round_trip(bridge)
 	_check("decoupling: register_handler + dispatch round-trip", rt_ok)
 
+	# ---- S7 generalization: lua_api reads the INJECTED VM -------------------
+	# The core must never look up a game-specific Lua autoload by name; it uses
+	# the set_lua_vm() injection seam only. Fresh bridge (no VM injected yet):
+	# lua_api returns a contract error with the actionable reason.
+	var no_vm: Dictionary = bridge._cmd_lua_api({})
+	_check("lua_api: no VM injected -> error envelope", "error" in no_vm)
+	_check("lua_api: no VM -> reason == lua_vm_not_registered",
+			no_vm.get("error", {}).get("reason") == "lua_vm_not_registered")
+	# Inject a stub VM exposing bridge_registry.live_names() -> names returned.
+	var stub_vm := StubLuaVM.new()
+	var stub_reg := StubBridgeRegistry.new()
+	stub_reg.names = ["test_fn_one", "test_fn_two"]
+	stub_vm.bridge_registry = stub_reg
+	bridge.set_lua_vm(stub_vm)
+	var api: Dictionary = bridge._cmd_lua_api({})
+	_check("lua_api: injected VM -> ok result", api.get("result", {}).get("ok") == true)
+	_check("lua_api: injected VM -> live_names() returned",
+			api.get("result", {}).get("functions") == ["test_fn_one", "test_fn_two"])
+	stub_vm.free()  # not in the tree; free explicitly so the bridge drops it
+
 	bridge.queue_free()
 	await process_frame  # let the bridge (and its TCP listener) be freed
 
@@ -180,3 +200,16 @@ func _check(label: String, condition: bool) -> void:
 	else:
 		_failures += 1
 		print("  FAIL: %s" % label)
+
+
+## Stub of the injected Lua VM's shape for the lua_api checks: a Node (the
+## type set_lua_vm() accepts) carrying a bridge_registry with live_names().
+class StubBridgeRegistry extends RefCounted:
+	var names: Array = []
+
+	func live_names() -> Array:
+		return names
+
+
+class StubLuaVM extends Node:
+	var bridge_registry: RefCounted = null

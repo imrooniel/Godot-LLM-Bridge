@@ -1565,14 +1565,22 @@ func _cmd_game_status(_params: Dictionary) -> Dictionary:
 	}}
 
 ## S7 introspection: list the registered Lua bridge function names — the live
-## entries of LuaVM.bridge_registry (the set reexpose() would write into a
-## fresh state after a vm_reset). LuaVM is an autoload, so it resolves at
-## /root/LuaVM in the game process.
-func _cmd_lua_api(_params: Dictionary) -> Dictionary:
+## entries of the injected Lua VM's bridge_registry (the set reexpose() would
+## write into a fresh state after a vm_reset). The VM arrives via the
+## set_lua_vm() injection seam; the core never looks up a game autoload by name.
+## Without a registered VM the handler returns a contract error carrying the
+## actionable reason "lua_vm_not_registered" (same error shape as the sibling
+## execute_lua handler, extended with reason/suggested per the legibility spec).
+func _cmd_lua_api(params: Dictionary) -> Dictionary:
+	if not has_lua_vm():
+		var resp: Dictionary = _make_error(params.get("__id", null), -32602,
+			"no Lua engine registered (call DebugBridge.set_lua_vm(node))")
+		resp["error"]["reason"] = "lua_vm_not_registered"
+		resp["error"]["suggested"] = ["register the game's Lua VM: DebugBridge.set_lua_vm(lua_vm_node)"]
+		return resp
 	var names: Array = []
-	var lua_vm: Node = get_node_or_null("/root/LuaVM")
-	if lua_vm != null and "bridge_registry" in lua_vm:
-		names = lua_vm.bridge_registry.live_names()
+	if "bridge_registry" in _lua_vm:
+		names = _lua_vm.bridge_registry.live_names()
 	return {"result": {"ok": true, "functions": names}}
 
 # --- execute_lua (main-thread) --------------------------------------------
