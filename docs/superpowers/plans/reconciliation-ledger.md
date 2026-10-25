@@ -70,3 +70,14 @@ arrived with their scripts.
   repos); they still lack PR #1's docs (time-scale correction,
   `debugger clear-breakpoints`, self-healing section) — re-mine in the
   skills/docs tasks.
+- `bridge/cli/editor_bridge_cli.py`: `change-scene` parser help names
+  `combat._start_from_config` (MW combat flow); generalize to a game-agnostic
+  description in Tasks 2–4.
+- `bridge/autoloads/debug_bridge.gd`: `_cmd_game_status` reports
+  `in_combat` derived from a hardcoded `/root/Main` node check; generalize
+  the status field (or make it project-configurable) in Tasks 2–4.
+- `res://scenes/combat.tscn` doc-example references in `editor_bridge_cli.py`
+  usage docstring and command-script headers
+  (`query_scene.gd`, `query_scene_tree.gd`, `action_scene_open.gd`,
+  `action_scene_reload.gd`); replace with a neutral example scene path in
+  Tasks 2–4.
