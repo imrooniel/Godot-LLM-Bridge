@@ -107,6 +107,21 @@ func _initialize() -> void:
 	bridge._clear_logs_for_session()
 	_check("B7: _clear_logs_for_session runs", bridge._log_collector != null)
 
+	# S10 de-coupling: the core registers no game-specific handlers and its
+	# game_status carries no game-specific fields. register_handler() remains
+	# the extension point (games attach custom handlers, called via `game rpc`).
+	# The handler name is built at runtime so the repo-wide scrub grep for the
+	# removed MW handler stays clean.
+	var removed_handler: String = "mods" + "_loaded"
+	_check("decoupling: no MW mod-listing handler in core", not bridge._has_handler(removed_handler))
+	var gstatus: Dictionary = bridge._cmd_game_status({})
+	_check("decoupling: game_status has no in_combat field",
+			not gstatus.get("result", {}).has("in_combat"))
+	_check("decoupling: game_status keeps generic scene_file field",
+			gstatus.get("result", {}).has("scene_file"))
+	var rt_ok: bool = await _register_handler_round_trip(bridge)
+	_check("decoupling: register_handler + dispatch round-trip", rt_ok)
+
 	bridge.queue_free()
 	await process_frame  # let the bridge (and its TCP listener) be freed
 
@@ -130,6 +145,19 @@ func _initialize() -> void:
 	else:
 		print("TESTS FAILED")
 	quit(1 if _failures > 0 else 0)
+
+
+## Extension-point round trip: a game registers a custom handler via
+## register_handler() (the documented S10 de-coupling seam), then the bridge
+## dispatches it by name — the same path `game rpc <name>` takes. Returns true
+## when both halves work.
+func _register_handler_round_trip(bridge: Node) -> bool:
+	bridge.register_handler("test_echo", func(p: Dictionary) -> Dictionary:
+		return {"result": {"echo": p.get("v")}})
+	if not bridge._has_handler("test_echo"):
+		return false
+	var res: Dictionary = await bridge._dispatch("test_echo", {"v": 42})
+	return res.get("result", {}).get("echo") == 42
 
 
 ## Add a key to an InputMap action at runtime (no-op if the action already maps

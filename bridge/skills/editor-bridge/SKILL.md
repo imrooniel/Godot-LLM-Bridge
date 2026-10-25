@@ -121,7 +121,7 @@ commands). Game-side equivalent of both: `game gd-eval` + the builder pattern.
 
 ```bash
 python3 bridge/cli/editor_bridge_cli.py game ping                 # editor state + game pong
-python3 bridge/cli/editor_bridge_cli.py game game-status          # scene name, in_combat
+python3 bridge/cli/editor_bridge_cli.py game game-status          # scene name, scene file
 python3 bridge/cli/editor_bridge_cli.py game scene-info
 python3 bridge/cli/editor_bridge_cli.py game inspect-tree [path] --depth N
 python3 bridge/cli/editor_bridge_cli.py game get <node_path> <prop>

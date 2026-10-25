@@ -369,7 +369,6 @@ func _init_handlers() -> void:
 		"inject_input_event":  _cmd_inject_input_event,
 		"graceful_quit":       _cmd_graceful_quit,
 		"game_status":         _cmd_game_status,
-		"mods_loaded":         _cmd_mods_loaded,
 		"lua_api":             _cmd_lua_api,
 		"execute_lua":         _cmd_execute_lua,
 		"gd_eval":             _cmd_gd_eval,
@@ -401,7 +400,9 @@ func _clear_logs_for_session() -> void:
 		file.close()
 	print("[DebugBridge] Log collector cleared for new session (%s)" % log_file)
 
-## Allow external autoloads (e.g., GameBridge) to register custom JSON-RPC handlers.
+## Allow external autoloads (e.g., GameBridge) or game code to register custom
+## JSON-RPC handlers — the extension seam that keeps game-specific commands out
+## of the core. Registered handlers are callable via `game rpc <name>`.
 func register_handler(method_name: String, handler: Callable) -> void:
 	_handlers[method_name] = handler
 
@@ -1557,30 +1558,11 @@ func _cmd_game_status(_params: Dictionary) -> Dictionary:
 	if root != null:
 		scene_name = root.name
 		scene_file = root.scene_file_path
-	var in_combat: bool = get_node_or_null("/root/Main") != null
 	return {"result": {
 		"scene_name": scene_name,
 		"scene_file": scene_file,
 		"port": _bound_port,
-		"in_combat": in_combat,
 	}}
-
-## S10 pre-flight: list the mod ids loaded in the game. ModLoader is an
-## autoload (project.godot), so it resolves at /root/ModLoader in the game
-## process. loaded_mods holds ModInfo objects (a ModDiscovery inner class),
-## NOT dicts — read mod_id via Object.get(), with a dict fallback so the
-## handler stays correct if the element type ever changes.
-func _cmd_mods_loaded(_params: Dictionary) -> Dictionary:
-	var mod_loader: Node = get_node_or_null("/root/ModLoader")
-	if mod_loader == null:
-		return {"result": {"ok": true, "mods": [], "note": "ModLoader not present"}}
-	var ids: Array = []
-	for mod in mod_loader.loaded_mods:
-		if mod is Dictionary and "mod_id" in mod:
-			ids.append(str(mod["mod_id"]))
-		elif mod is Object:
-			ids.append(str(mod.get("mod_id")))
-	return {"result": {"ok": true, "mods": ids}}
 
 ## S7 introspection: list the registered Lua bridge function names — the live
 ## entries of LuaVM.bridge_registry (the set reexpose() would write into a

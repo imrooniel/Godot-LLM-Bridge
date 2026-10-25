@@ -1037,7 +1037,6 @@ GAME_COMMANDS = {
     "screenshot-b64":  ("screenshot_base64", lambda a: {"scale": a.scale,
                                                         "wait_ms": a.wait_ms}),
     "game-status":     ("game_status", lambda a: {}),
-    "mods-loaded":     ("mods_loaded", lambda a: {}),
     "lua-api":         ("lua_api", lambda a: {}),
     # Closed-loop driving (ported from community v2.3): held input + batch read +
     # per-frame telemetry.
@@ -1089,7 +1088,7 @@ GAME_TIMEOUTS = {"lua-eval": SLOW_GAME_OP_TIMEOUT,
 # EXCLUDED — blind-retrying them could double-apply. Ported from community v2.3.
 RETRYABLE_GAME_COMMANDS = {
     "get", "get-many", "held-keys", "inspect-tree", "scan-ui", "find-nodes",
-    "game-status", "mods-loaded", "lua-api", "sample", "screenshot",
+    "game-status", "lua-api", "sample", "screenshot",
     "screenshot-b64",
     "logs", "crashes",
     "api-class",
@@ -1236,7 +1235,6 @@ def build_parser() -> argparse.ArgumentParser:
     gssb64.add_argument("--wait-ms", dest="wait_ms", type=int, default=0,
                         help="Settle N ms before capturing (the last rendered frame)")
     g_sub.add_parser("game-status")
-    g_sub.add_parser("mods-loaded", help="List mods loaded in the game (S10 pre-flight)")
     g_sub.add_parser("lua-api", help="List registered Lua bridge functions (S7)")
     glua = g_sub.add_parser("lua-eval")
     glua.add_argument("code")

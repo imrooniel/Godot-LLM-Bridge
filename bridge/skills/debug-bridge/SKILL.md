@@ -63,7 +63,7 @@ All game commands are one-shot request/response (file mailbox) — parallel invo
 ```bash
 python3 bridge/cli/editor_bridge_cli.py game ping
 python3 bridge/cli/editor_bridge_cli.py game scene-info
-python3 bridge/cli/editor_bridge_cli.py game game-status          # scene name, in_combat flag
+python3 bridge/cli/editor_bridge_cli.py game game-status          # scene name, scene file, bound port
 python3 bridge/cli/editor_bridge_cli.py game inspect-tree root --depth 3
 python3 bridge/cli/editor_bridge_cli.py game inspect-control MainMenu/StartButton
 python3 bridge/cli/editor_bridge_cli.py game find-nodes --type Button --name-pattern "Start*"
@@ -138,6 +138,10 @@ python3 bridge/cli/editor_bridge_cli.py game mouse move 400 300
 ```bash
 python3 bridge/cli/editor_bridge_cli.py game call <node_path> <method> [args...]
 ```
+
+**Custom handlers (extension point):** the core registers only generic handlers — games add their
+own commands with `DebugBridge.register_handler(name, callback)` and call them via
+`python3 bridge/cli/editor_bridge_cli.py game rpc <name> [--params '{...}']`.
 
 > **Note on Lua support:** Lua-specific commands (`lua-eval`, `lua-eval-act`, `call LuaVM ...`) require the `lua-gdextension` plugin to be enabled in your project. If the Lua extension is not present or not enabled, these commands will not be available. The bridge works purely with GDScript and Godot nodes by default.
 
