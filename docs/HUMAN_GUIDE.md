@@ -160,3 +160,33 @@ See `bridge/game/GUIDE.md` for the builder's readback contract.
 See `bridge/game/example/` for a minimal worked sample (a player, an NPC, a transition
 zone, and a state-hub autoload) demonstrating the hook-in pattern, and
 `bridge/game/GUIDE.md` for the full contract.
+
+## Windows smoke checklist (owner, run once per release)
+
+CI covers the CLI test suite on Windows, but the editor-runtime integration
+job is Linux-only — run this on a real Windows PC before tagging a release
+(it exercises the Windows process routes: CIM process listing, `taskkill`,
+detached spawn):
+
+1. `python bridge\cli\editor_bridge_cli.py doctor` — all `[ok]` except the
+   expected heartbeat `[warn]`; a wrong `godot_binary` FAIL means discovery
+   (registry / common locations) missed your install.
+2. `python bridge\cli\editor_bridge_cli.py launch` — editor opens, command
+   returns after the heartbeat; close the terminal — the editor SURVIVES
+   (detached spawn).
+3. `ping` → alive; `query state` → sane.
+4. `action scene-play --path res://scenes/main.tscn` → `game ping` reports
+   `game_bridge: true`.
+5. Second `launch` → `Error [editor_running]` listing the pid (CIM process
+   listing works; a stale/no-match here means `Win32_Process.CommandLine`
+   came back empty for the editor).
+6. `launch --force` → kills that editor (via `taskkill /F`) and relaunches;
+   no orphan Godot windows in Task Manager afterwards.
+7. `action scene-play` (with a game running) → `Error [game_playing]`;
+   `action scene-stop` → clean.
+8. Play a scene, then `launch --force` again → orphan GAME killed too
+   (check Task Manager).
+9. `debugger state` (Godot 4.8+) → `{connected: false}` or a DAP answer —
+   never a hang.
+
+Any step failing = file it with the doctor output before the release ships.
