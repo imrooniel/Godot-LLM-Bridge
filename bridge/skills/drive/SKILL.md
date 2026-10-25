@@ -1,6 +1,6 @@
 ---
 name: drive
-description: Use when driving a running Godot 4 game in a closed feedback loop — injecting held input, sampling per-frame telemetry, asserting an invariant, then adjusting input and repeating until the invariant holds or a stop condition is met. Trigger keywords: drive loop, held input, game hold, game release, game held-keys, telemetry, game watch, game sample, game get-many, per-frame sample, invariant, close-the-loop, "drive the game", "make the player move".
+description: Use when you need to drive a running Godot 4 game in a closed feedback loop — injecting held input, sampling per-frame telemetry, asserting an invariant, then adjusting input and repeating until the invariant holds or a stop condition is met. Use this instead of one-shot `game get` when the target property changes over time (movement, animation, physics) and you must observe it across frames. Trigger keywords: drive loop, held input, hold key, release key, game hold, game release, held-keys, telemetry, game watch, game sample, game get-many, per-frame sample, invariant, close-the-loop, "drive the game", "make the player move", game bridge unreachable.
 ---
 
 # Agent Skill: Drive
@@ -10,11 +10,6 @@ per-frame telemetry → assert an invariant → adjust input → repeat. All com
 `bridge/cli/editor_bridge_cli.py` under the `game` tree. Use this when the thing you care about
 is a *time series* (position, rotation, gait, physics state) — a one-shot `game get` cannot
 show motion.
-
-> **When to use:** you need to *drive* the game (make something move) and *observe* it over
-> time. Trigger keywords: drive loop, held input, hold key, release key, `game hold`,
-> `game release`, `held-keys`, telemetry, `game watch`, `game sample`, `game get-many`,
-> per-frame sample, invariant, close-the-loop, "drive the game", "make the player move".
 
 ## Pre-flight Checklist (DO THIS FIRST)
 
@@ -59,7 +54,7 @@ python3 bridge/cli/editor_bridge_cli.py game release W     # ALWAYS release when
 returns the capped ring buffer. `game telemetry-stop` stops and discards it.
 
 ```bash
-# Start: watch Main/Player's global_position and rotation.y at ~30 Hz
+# Start: watch a node's global_position and rotation.y at ~30 Hz
 python3 bridge/cli/editor_bridge_cli.py game watch --nodes Main/Player \
     --props '["global_position","rotation.y"]' --hz 30
 sleep 2
@@ -119,6 +114,8 @@ held** before finishing.
 - **Holding a key and never releasing it** → the controller stays stuck. Always `game release`.
 - **Asserting on a single `game get`** → that's a snapshot, not motion. Use `watch` + `sample`.
 - **Letting the telemetry buffer overflow** → it caps at ~600 samples and rolls; sample in time.
-- **`time-scale 0.0`** → crashes the game (use `0.5` minimum).
+- **`time-scale 0.0`** → doesn't crash, but freezes the game AND stalls the game bridge (its
+  socket-poll Timer ticks in scaled time, so later `game.*` commands time out). Use `0.1`
+  minimum; if already stuck at `0`, recover with `action scene-stop` or `recover`.
 - **Trusting the first sample after a mutation** → the response can be one step behind; re-read
   `held-keys` / `sample` to confirm the mutation actually applied.

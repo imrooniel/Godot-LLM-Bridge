@@ -9,7 +9,7 @@ Interact with a **running** Godot 4 game from the terminal. Game operations go t
 
 ## Two-Process Model (critical)
 
-The game runs as a **separate OS process** from the editor. Autoloads (`LuaVM`, `GameSession`, …) exist **only in the game process**. `EditorBridge` (editor process) handles editor state/lifecycle/logs and **proxies** `game.*` commands to the in-game `DebugBridge` (port 5555).
+The game runs as a **separate OS process** from the editor. Your game's autoloads (a game/session manager, save manager, …) exist **only in the game process**. `EditorBridge` (editor process) handles editor state/lifecycle/logs and **proxies** `game.*` commands to the in-game `DebugBridge` (port 5555).
 
 Therefore: `game ping` before any `game.*` command. If the game isn't running, every `game.*` command fails with `Game bridge unreachable`.
 
@@ -34,7 +34,7 @@ python3 bridge/cli/editor_bridge_cli.py launch
 
 # Start/stop the game inside the editor:
 python3 bridge/cli/editor_bridge_cli.py action scene-play            # play the current scene
-python3 bridge/cli/editor_bridge_cli.py action scene-play --path res://scenes/combat.tscn
+python3 bridge/cli/editor_bridge_cli.py action scene-play --path res://scenes/game.tscn
 python3 bridge/cli/editor_bridge_cli.py action scene-stop
 ```
 
@@ -44,15 +44,16 @@ Then `game ping` again to confirm the bridge came up.
 
 ```
 editor_bridge_cli.py
-├── launch                    # start the editor, wait for heartbeat
+├── launch | restart | recover   # start / quit+wait+launch / one-shot self-heal
 ├── ping                      # editor liveness (heartbeat)
 ├── connect                   # verify editor reachable, print state
-├── query <state|editor|scene|scene-tree|fs|...>
-├── action <scene-open|scene-play|scene-stop|scene-save|...|editor-restart|...>
-├── game <ping|inspect-tree|get|set|signal|call|...>     # proxied to 5555
-├── debugger <state|attach|break|pause|step-*|stack|vars|eval|...>  # real DAP
+├── query <state|editor|scene|scene-tree|fs|autoloads|godot-status|human-deltas|...>
+├── action <scene-open|scene-play|scene-stop|scene-save|fs-scan|run-script|...>
+├── game <ping|inspect-tree|get|set|signal|call|hold|watch|rpc|...>   # proxied to 5555
+├── debugger <state|attach|break|clear-breakpoints|pause|step-*|stack|vars|eval|...>  # real DAP
 ├── subscribe <events|console|debugger|listen|state>
-└── logs get --source {auto|panel|collector|process}
+├── logs get --source {auto|panel|collector|process}
+└── suite-result --path <result-file>   # trustworthy on-disk test marker (S2/S8)
 ```
 
 All game commands are one-shot request/response (file mailbox) — parallel invocations are safe. `subscribe listen` is the only long-lived streaming mode.
@@ -68,19 +69,19 @@ python3 bridge/cli/editor_bridge_cli.py game inspect-tree root --depth 3
 python3 bridge/cli/editor_bridge_cli.py game inspect-control MainMenu/StartButton
 python3 bridge/cli/editor_bridge_cli.py game find-nodes --type Button --name-pattern "Start*"
 python3 bridge/cli/editor_bridge_cli.py game scan-ui --types Button CheckBox
-python3 bridge/cli/editor_bridge_cli.py game methods LuaVM [--pattern foo]
-python3 bridge/cli/editor_bridge_cli.py game signals GameSession
+python3 bridge/cli/editor_bridge_cli.py game methods GameManager [--pattern save]
+python3 bridge/cli/editor_bridge_cli.py game signals GameManager
 ```
 
 **Property access** (targets the GDScript node directly):
 ```bash
 python3 bridge/cli/editor_bridge_cli.py game get MainMenu/StartButton text
-python3 bridge/cli/editor_bridge_cli.py game set GameSession time_scale 0.5
+python3 bridge/cli/editor_bridge_cli.py game set GameManager time_scale 0.5
 ```
 
 **Expression evaluation** (GDScript in the running game; autoloads/globals resolve):
 ```bash
-python3 bridge/cli/editor_bridge_cli.py game gd-eval "GameSession.party[0].name"
+python3 bridge/cli/editor_bridge_cli.py game gd-eval "MyStateHub.party[0].hp"
 python3 bridge/cli/editor_bridge_cli.py game eval "1 + 2 * 3"     # `eval` = alias of `gd-eval`
 python3 bridge/cli/editor_bridge_cli.py game gd-eval "Vector2(3, 4).length()"
 ```
@@ -124,7 +125,7 @@ call again; no scene restart, deterministic). Pair with `action run-script`
 **UI interaction** — PREFER `signal` (always works, ignores window scaling):
 ```bash
 python3 bridge/cli/editor_bridge_cli.py game signal MainMenu/StartButton pressed
-python3 bridge/cli/editor_bridge_cli.py game click-node Main/HexGrid      # clicks node center (less reliable)
+python3 bridge/cli/editor_bridge_cli.py game click-node Main/GameArea      # clicks node center (less reliable)
 ```
 
 **Key / mouse** (ALWAYS `--release` a key you pressed):
@@ -139,17 +140,45 @@ python3 bridge/cli/editor_bridge_cli.py game mouse move 400 300
 python3 bridge/cli/editor_bridge_cli.py game call <node_path> <method> [args...]
 ```
 
+**Held input** (drive a controller that polls `Input.get_vector` / `is_action_pressed`;
+`game key` only fires `_input` callbacks and will NOT move a polling controller):
+```bash
+python3 bridge/cli/editor_bridge_cli.py game hold W        # press AND hold (marks the mapped action held)
+python3 bridge/cli/editor_bridge_cli.py game held-keys     # show currently held keys/actions
+python3 bridge/cli/editor_bridge_cli.py game release W     # ALWAYS release when done
+```
+
+**Per-frame telemetry** (observe motion over frames — position/rotation/physics change):
+```bash
+python3 bridge/cli/editor_bridge_cli.py game watch --nodes Main/Player --props '["global_position","rotation.y"]' --hz 30
+python3 bridge/cli/editor_bridge_cli.py game sample --limit 3
+python3 bridge/cli/editor_bridge_cli.py game telemetry-stop
+```
+
+> **Single-client bridge:** space out `game` calls (a burst can read the previous pending
+> response). Idempotent reads (get/get-many/watch/sample/held-keys/screenshot) auto-retry up
+> to 3× on a transient drop; mutations (set/hold/release/call) never blind-retry. `--no-retry`
+> disables read retry. See the `drive` skill for the full closed-loop workflow.
+
 **Custom handlers (extension point):** the core registers only generic handlers — games add their
 own commands with `DebugBridge.register_handler(name, callback)` and call them via
-`python3 bridge/cli/editor_bridge_cli.py game rpc <name> [--params '{...}']`.
+`python3 bridge/cli/editor_bridge_cli.py game rpc <name> [--json-params '{...}']`
+(`--params` is an accepted alias).
 
-> **Note on Lua support:** Lua-specific commands (`lua-eval`, `lua-eval-act`, `call LuaVM ...`) require the `lua-gdextension` plugin to be enabled in your project. If the Lua extension is not present or not enabled, these commands will not be available. The bridge works purely with GDScript and Godot nodes by default.
+**In-game scene swap:** `python3 bridge/cli/editor_bridge_cli.py game change-scene res://scenes/x.tscn`
+runs `change_scene_to_file` on the game's MAIN thread and awaits the deferred swap completing
+(the response means "the new scene is live"). Typical flow: `game set <your session autoload>
+<config prop> '{...}'` first, then `change-scene` to the scene that reads it.
 
-**Screenshots / time:**
+> **Note on Lua support:** Lua-specific commands (`lua-eval`, `lua-eval-act`) require the `lua-gdextension` plugin to be enabled in your project AND the game to hand its Lua VM to the bridge (`DebugBridge.set_lua_vm(node)` at startup). Without a registered VM these commands fail with a `lua_vm_not_registered` error. The bridge works purely with GDScript and Godot nodes by default.
+
+**Screenshots / time / crashes:**
 ```bash
 python3 bridge/cli/editor_bridge_cli.py game screenshot user://my_screen.png
 python3 bridge/cli/editor_bridge_cli.py game screenshot-b64 --scale 0.5
-python3 bridge/cli/editor_bridge_cli.py game time-scale 0.5   # NEVER 0.0 — it crashes the game
+python3 bridge/cli/editor_bridge_cli.py game time-scale 0.5   # never 0.0 — freezes the game AND stalls the game bridge (≥ 0.1)
+python3 bridge/cli/editor_bridge_cli.py game crashes [--max-lines 50]   # recent crash/error entries + flag
+python3 bridge/cli/editor_bridge_cli.py game clear-crashes
 ```
 
 **Game logs (in-memory collector; cleared each game run):**
@@ -162,19 +191,19 @@ python3 bridge/cli/editor_bridge_cli.py game clear-logs
 
 ## ⚠️ Lua vs GDScript Namespace (Only if Lua extension is enabled)
 
-If your project has the `lua-gdextension` plugin enabled and the `LuaVM` autoload, be aware that Lua and GDScript have **separate namespaces for autoloads.** Writing `GameSession.combat_config` via `lua-eval` sets the Lua-side `GameSession` table — **NOT** the GDScript autoload `GameSession`. This is a common source of silent bugs where Lua-side tables are modified instead of the GDScript autoloads.
+If your project has the `lua-gdextension` plugin enabled and a registered Lua VM, be aware that Lua and GDScript have **separate namespaces for autoloads.** Writing `GameManager.save_slots` via `lua-eval` sets the Lua-side `GameManager` table — **NOT** the GDScript autoload `GameManager`. This is a common source of silent bugs where Lua-side tables are modified instead of the GDScript autoloads.
 
 **CRITICAL RULE (if Lua is enabled):**
 - **Never use `lua-eval` to modify GDScript autoload properties.**
-- Use `python3 bridge/cli/editor_bridge_cli.py game set <node_path> <prop> <value>` for **GDScript autoload properties** (e.g., `GameSession`).
+- Use `python3 bridge/cli/editor_bridge_cli.py game set <node_path> <prop> <value>` for **GDScript autoload properties** (e.g., your game manager).
 - Use `python3 bridge/cli/editor_bridge_cli.py game lua-eval` **only** for Lua module APIs (if applicable).
 
 ```bash
-# CORRECT — writes the GDScript GameSession autoload:
-python3 bridge/cli/editor_bridge_cli.py game set GameSession combat_config '{"players":[...]}'
+# CORRECT — writes the GDScript GameManager autoload property:
+python3 bridge/cli/editor_bridge_cli.py game set GameManager save_slots '{"slots":[1,2]}'
 
-# WRONG — Lua-side GameSession is a separate table, invisible to GDScript (if Lua is enabled):
-python3 bridge/cli/editor_bridge_cli.py game lua-eval 'GameSession.combat_config = {...}'
+# WRONG — Lua-side GameManager is a separate table, invisible to GDScript (if Lua is enabled):
+python3 bridge/cli/editor_bridge_cli.py game lua-eval 'GameManager.save_slots = {...}'
 ```
 
 Use `set`/`call`/`get` for GDScript autoload properties. If the `lua-gdextension` is not enabled or not present in your project, the bridge works purely with GDScript and Godot nodes, and Lua-specific commands are not available.
@@ -198,25 +227,15 @@ Using `debugger launch --scene <scene>` when the game is already running via `ac
   ```
   `panel` = editor output panel (threaded `RichTextLabel`; read via `get_parsed_text()`, not `get_text()`). `process` = the captured godot process stdout (`.tmp/logs/`). `collector` = the game log collector.
 
-### Key Log Tags
+### Reading test-harness output
 
-| Tag | Source | Purpose |
-|-----|--------|---------|
-| `[PROJ_DBG]` | GDScript + Lua | Projectile lifecycle: spawn, reconcile, snapshot, frames, death |
-| `[SEG_COLLIDE]` | Lua | Segment-level projectile collision summary |
-| `[SEG_PVP]` | Lua | Projectile-vs-projectile damage (with HP snapshots) |
-| `[SEG_HIT]` | Lua | Individual hit: damage dealt, target HP before/after |
-| `[COMMIT]` | Lua | Turn commit: grid placement, animation building |
-| `[PLAN]` | Lua | Turn plan: occupancy, conflicts |
-| `[RESOLVE]` | Lua | Hex-level collision resolution |
-| `[RECONCILE]` | GDScript | Renderer reconciliation (snap, create, orphan removal) |
-| `[ANIM_START]` / `[ANIM_FRAME]` / `[ANIM_COMPLETE]` / `[ANIM_INTERRUPTED]` | GDScript | Animation lifecycle |
-| `[DEATH_START]` / `[DEATH_COMPLETE]` | GDScript | Death animation lifecycle |
-| `[COLLIDE]` | Lua | Hex-level collision resolver |
-| `[TEST PASS/FAIL/SKIP/SUMMARY]` | Lua test runner | Test results |
+Bridge tests print whatever markers the harness defines; the reliable channel is
+the harness's **on-disk result file**, read via
+`python3 bridge/cli/editor_bridge_cli.py suite-result --path <file>` (user://,
+res://-adjacent, absolute, or project-relative). It survives a bridge drop, so
+a missing console summary is never a pass (S2/S8).
 
-- Lua logs are prefixed `[Lua]`; GDScript `print()` has no prefix.
-- The collector grows during play (thousands of lines in a long session).
+- The game log collector grows during play (thousands of lines in a long session) — page with `--from` / `--tail`.
 
 ## Common Mistakes
 
@@ -224,7 +243,9 @@ Using `debugger launch --scene <scene>` when the game is already running via `ac
 - **Orphaned game process** → a leftover game process crashes a new editor on launch. `action scene-stop` (or kill the game) before restarting the editor.
 - **Wrong `game` subcommand spelling** → they are **hyphenated**: `lua-eval`, `scan-ui`, `find-nodes`, `click-node`, `time-scale`, `screenshot-b64`, `clear-logs`, `game-status`, `inspect-tree`, `inspect-control`. The CLI rejects the underscore forms.
 - **Compound bash commands** → prefer one command per tool call where possible.
-- **`time-scale 0.0`** → crashes the game.
+- **`time-scale 0.0`** → doesn't crash, but freezes the game AND stalls the game bridge (its socket-poll Timer ticks in scaled time; later `game.*` commands time out). Use ≥ 0.1; recover from a stuck 0 with `action scene-stop` or `recover`.
+- **Game boots paused (`breaked: true`)** → leftover editor breakpoints ride along to every spawned game. `debugger clear-breakpoints` before `action scene-play`.
+- **Re-running `scene-play` on a failed `game.*`** → the game is usually paused, not dead; the CLI prints an inline pause report. `debugger continue` to resume, or `recover` for the one-shot heal.
 - **Key press without `--release`** → leaves the key held.
 - **`click-node`/`mouse`** → coordinate-dependent; prefer `signal … pressed`.
 - **Unquoted `@` paths / hardcoded `@Button@N`** → auto-generated node ids change every run. Always `scan-ui`/`find-nodes` first, then match by text.
