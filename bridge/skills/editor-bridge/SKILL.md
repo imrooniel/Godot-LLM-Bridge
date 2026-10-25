@@ -67,6 +67,8 @@ Binary detection order: `GODOT_EDITOR_BINARY` env → project-local `.godot-edit
 # Startup can take a while (first import after an engine upgrade reimports
 # everything); launch waits up to 300 s — give the call a tool timeout > 300000 ms.
 python3 bridge/cli/editor_bridge_cli.py launch
+# launch gates the engine version (Error [godot_version] = below the supported
+# floor — repin the binary per doctor/CONTRIBUTING; relaunching won't help).
 
 # Reliable restart: stop game + quit + wait for the PID to die + launch.
 # ('action editor-restart' is the ENGINE's restart = quit + best-effort spawn
