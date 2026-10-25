@@ -1520,6 +1520,7 @@ def run_doctor(project_path: str, as_json: bool) -> int:
         python_version=tuple(sys.version_info[:2]),
         godot_version_out=_doctor_godot_version(proj),
         heartbeat_age_s=_doctor_heartbeat_age(proj),
+        heartbeat_stale_s=LIVE_WINDOW_S,
         os_name=platform.system(),
     )
     ok = not any(c["status"] == "fail" for c in checks)
