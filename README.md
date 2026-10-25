@@ -17,7 +17,7 @@ their own RPC handlers).
 |---|---|
 | **Godot** | **4.7+** for the core bridge (CI-tested on 4.7.2). `debugger …` commands need **4.8+** — the engine's built-in Debug Adapter Protocol server is 4.8+ only; on 4.7 they answer a clear "DAP not connected" error (or `connected: false`), everything else works. |
 | **OS** | Windows 10/11 and Linux (CLI test suite CI-covered on both; the editor-runtime integration job is Linux-only today). macOS is not tested and out of scope for support; community patches welcome. |
-| **Python** | 3.11+ (CLI is stdlib-only — zero pip installs). |
+| **Python** | 3.9+ (CLI is stdlib-only — zero pip installs; CI-tested on 3.11 & 3.12). |
 
 > As of Oct 2026 the newest **official stable** Godot is 4.7.2; 4.8 lives in
 > dev builds. The bridge is developed against 4.8-dev and gated on 4.7.2 in

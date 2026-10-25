@@ -14,3 +14,6 @@ __pycache__/
 # Agent skill/tooling config (keep only the human-facing AGENTS.md)
 .opencode/*
 !.opencode/AGENTS.md
+
+# Per-machine Godot binary pointer (see CONTRIBUTING dev setup)
+.godot-editor-path
