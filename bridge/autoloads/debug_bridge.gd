@@ -45,7 +45,6 @@ func _ready() -> void:
 	_server = TCPServer.new()
 	_init_handlers()
 	_init_log_collector()
-	_clear_logs_for_session()
 	_start_listening()
 
 	# Use a Timer to poll the socket — works reliably even when scene is paused
@@ -384,11 +383,27 @@ func _init_handlers() -> void:
 	}
 
 func _init_log_collector() -> void:
-	_log_collector = _LogCollectorScript.new()
-	OS.add_logger(_log_collector)
+	# Reuse the collector registered early by the EarlyLogCollector autoload
+	# (position 1) so entries captured from the first autoload onward are
+	# retained. Fall back to creating a new one only if that autoload did not
+	# run (e.g. disabled, or the bridge is instantiated directly in a test).
+	var existing: DebugLogCollector = DebugLogCollector.get_shared()
+	if existing != null:
+		_log_collector = existing
+	else:
+		_log_collector = _LogCollectorScript.new()
+		OS.add_logger(_log_collector)
+	# NOTE: no clear here. The session clear moved to registration time (the
+	# EarlyLogCollector autoload's _init()), where a fresh process's buffer is
+	# empty (a no-op) and a persistent process gets a clean slate. Clearing
+	# here would wipe the early entries captured from the first autoload onward.
 
 ## Clear in-memory log collector and truncate the log file at the start of each game run.
 ## This prevents log pollution from previous sessions.
+##
+## No longer called from _ready() (the session clear moved to the
+## EarlyLogCollector autoload's registration time). Kept for on-demand use and
+## the headless test (test_bridge.gd), which calls it directly.
 func _clear_logs_for_session() -> void:
 	_log_collector.clear_messages()
 	# B7: per-instance log path (was a machine-global /tmp/godot_output.log that

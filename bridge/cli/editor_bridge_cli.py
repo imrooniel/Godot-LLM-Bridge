@@ -1330,11 +1330,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hot-reload a res:// .gd into the running game's cache — edit a "
              "builder script, reload, call it again (no scene restart)")
     grls.add_argument("path")
-    glogs = g_sub.add_parser("logs")
+    glogs = g_sub.add_parser(
+        "logs",
+        help="Read game logs — the in-game collector MERGED with the editor "
+             "process console (so C++ boot errors that fire before any autoload "
+             "are visible); --collector-only returns just the collector")
     glogs.add_argument("--from", dest="from_line", type=int, default=0)
     glogs.add_argument("--max-lines", type=int, default=5000)
     glogs.add_argument("--tail", type=int, default=0,
                        help="last N lines of the buffer (overrides --from)")
+    glogs.add_argument("--collector-only", action="store_true",
+                       help="return only the in-game collector (skip the "
+                            "process-console merge)")
     gkey = g_sub.add_parser("key")
     gkey.add_argument("key_name")
     gkey.add_argument("--release", action="store_true")
@@ -1464,6 +1471,21 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--source", default="auto",
                     choices=["auto", "panel", "collector", "process"])
     l_sub.add_parser("clear")
+
+    fbl = subparsers.add_parser(
+        "fresh-boot-logs",
+        help="Capture a fresh boot's logs with no cumulative pollution: "
+             "scene-stop → clear-logs → scene-play → wait → return only the "
+             "fresh boot's logs (the in-game collector — fresh in the new "
+             "game process — merged with the process console sliced from a "
+             "line offset recorded immediately before the boot)")
+    fbl.add_argument("--scene", default="res://scenes/landing.tscn",
+                     help="scene to boot (default: the project's main scene)")
+    fbl.add_argument("--wait", type=int, default=20,
+                     help="seconds to let the boot run before reading logs "
+                          "(default 20)")
+    fbl.add_argument("--max-lines", dest="max_lines", type=int, default=2000,
+                     help="max collector lines to return (default 2000)")
 
     sr = subparsers.add_parser(
         "suite-result",
@@ -1602,6 +1624,93 @@ def run_doctor(project_path: str, as_json: bool) -> int:
             print("\nFix the [FAIL] items above; [warn] items are "
                   "informational. Re-run doctor to confirm.")
     return 0 if ok else 1
+
+
+# Severity labels that may prefix a log line (collector "[LEVEL]" / console
+# "LEVEL:"). Used to normalize a line to its core message for cross-source
+# dedup.
+_LOG_SEVERITY_LABELS = (
+    "ERROR", "WARNING", "SCRIPT ERROR", "SHADER ERROR",
+    "LOG", "ERR", "INFO", "DEBUG",
+)
+_LOG_SEVERITY_PREFIXES = (
+    "SCRIPT ERROR:", "SHADER ERROR:", "ERROR:", "WARNING:",
+    "INFO:", "DEBUG:",
+)
+
+
+def _normalize_log_line(line: str) -> str:
+    """Normalize a log line for cross-source dedup (best-effort).
+
+    Strips a leading timestamp (``[123.456]``) and a leading severity prefix
+    (``[ERROR]`` / ``ERROR:`` / ``SCRIPT ERROR:`` / ...), lowercases, and
+    collapses whitespace. The in-game collector and the raw process console use
+    different formats (the collector collapses the console's multi-line
+    ``at:`` entries into one line), so some duplicate entries may survive —
+    that is safe: no content is ever dropped.
+    """
+    s = (line or "").strip()
+    # Strip up to two leading bracket tokens that are a timestamp or a severity
+    # label (collector form: "[123.456] [ERROR] details").
+    for _ in range(2):
+        if s.startswith("["):
+            close = s.find("]")
+            if close != -1 and close <= 40:
+                inner = s[1:close]
+                is_ts = inner.replace(".", "").replace("-", "").isdigit()
+                is_level = inner.upper() in _LOG_SEVERITY_LABELS
+                if is_ts or is_level:
+                    s = s[close + 1:].lstrip()
+                    continue
+        break
+    # Strip a leading "<LEVEL>:" prefix (raw console form).
+    for lvl in _LOG_SEVERITY_PREFIXES:
+        if s.startswith(lvl):
+            s = s[len(lvl):].lstrip()
+            break
+    return " ".join(s.split()).lower()
+
+
+def _merge_logs(collector_result: dict, console_result: dict) -> dict:
+    """Merge the in-game collector read with the editor process-console read.
+
+    The collector (via the EarlyLogCollector autoload) captures everything from
+    the first autoload onward. The process console additionally holds the game's
+    boot log from engine init (piped to the editor console on scene-play),
+    including C++ errors that fire BEFORE any autoload's _init() — which no
+    in-game collector can capture. The union, deduped by normalized form, makes
+    that error class visible without losing collector content.
+    """
+    collector_msgs = collector_result.get("messages", []) or []
+    console_msgs = console_result.get("messages", []) or []
+    seen = set()
+    merged = []
+    for m in collector_msgs:
+        merged.append(m)
+        key = _normalize_log_line(m)
+        if key:
+            seen.add(key)
+    added_from_console = 0
+    for line in console_msgs:
+        if not isinstance(line, str) or not line.strip():
+            continue
+        key = _normalize_log_line(line)
+        if key and key in seen:
+            continue
+        merged.append(line)
+        if key:
+            seen.add(key)
+        added_from_console += 1
+    return {
+        "messages": merged,
+        "total_lines": len(merged),
+        "from": 0,
+        "count": len(merged),
+        "source": "collector+process",
+        "collector_total": collector_result.get("total_lines"),
+        "process_total": console_result.get("total_lines"),
+        "process_added": added_from_console,
+    }
 
 
 def main() -> None:
@@ -1844,6 +1953,54 @@ def main() -> None:
                         _handle_game_error(e)
                 print(json.dumps(result, indent=2))
                 return
+            if args.game_command == "logs":
+                # Collector read (existing behavior) with the same bounded
+                # read-only retry as the generic path below.
+                timeout = GAME_TIMEOUTS.get("logs", DEFAULT_TIMEOUT)
+                retries = (0 if getattr(args, "no_retry", False)
+                          else (3 if "logs" in RETRYABLE_GAME_COMMANDS else 0))
+                attempt = 0
+                while True:
+                    try:
+                        collector_result = client.rpc(
+                            "game.get_godot_logs",
+                            {"from": args.from_line,
+                             "max_lines": args.max_lines,
+                             "tail": args.tail},
+                            timeout=timeout)
+                        break
+                    except EditorBridgeError as e:
+                        if _is_game_transport_failure(e) and attempt < retries:
+                            attempt += 1
+                            print("  [retry] logs (transport, attempt %d/%d) — %s"
+                                  % (attempt, retries, e), file=sys.stderr)
+                            time.sleep(min(0.5 * attempt, 1.5))
+                            continue
+                        _handle_game_error(e)
+                # --collector-only: the pre-existing collector-only behavior,
+                # preserved for consumers that want just the collector (the full
+                # envelope, as before).
+                if getattr(args, "collector_only", False):
+                    print(json.dumps(collector_result, indent=2))
+                    return
+                # Console/process fallback: the process console holds the game's
+                # full boot log (piped to the editor console on scene-play),
+                # including C++ errors that fire during ENGINE init — before any
+                # autoload's _init() — which no in-game collector can capture.
+                # A generous cap so the game's boot (at the END of the console,
+                # after the editor startup) is included.
+                console_result = client.rpc(
+                    "logs.get",
+                    {"from": 0, "max_lines": 5000, "source": "process"},
+                    timeout=timeout)
+                # Both rpc responses nest the payload under "result"; unwrap it
+                # (fall back to the whole dict for older bridges).
+                collector_payload = collector_result.get(
+                    "result", collector_result)
+                console_payload = console_result.get("result", console_result)
+                print(json.dumps(
+                    _merge_logs(collector_payload, console_payload), indent=2))
+                return
             method, params = GAME_COMMANDS[args.game_command]
             params = params(args)
             timeout = GAME_TIMEOUTS.get(args.game_command, DEFAULT_TIMEOUT)
@@ -1985,6 +2142,105 @@ def main() -> None:
             else:
                 result = client.rpc("logs.clear", {})
             print(json.dumps(result, indent=2))
+
+        elif args.command == "fresh-boot-logs":
+            state = client.ping()
+            # 1. Stop any running game. The collector lives in the game
+            #    process, and a fresh scene-play spawns a NEW process whose
+            #    collector starts empty — the collector side is naturally
+            #    fresh; the stop is what makes the BOOT itself fresh.
+            if (state.get("game", {}) or {}).get("running"):
+                client.rpc("action.scene.stop", {})
+                # Wait for the stop to settle (state.json game.running and
+                # game.bridge_connected -> false) so scene-play's pre-flight
+                # (is_playing_scene / orphan-port guard) sees a clean slate.
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    st = client.read_state() or {}
+                    g = st.get("game", {}) or {}
+                    if not g.get("running") and not g.get("bridge_connected"):
+                        break
+                    time.sleep(0.2)
+                # 2. clear-logs: a safety measure (reuses the existing
+                #    clear_godot_logs RPC). The old process may already be
+                #    gone — a transport failure is expected and harmless
+                #    (the new boot starts with an empty collector anyway).
+                try:
+                    client.rpc("game.clear_godot_logs", {})
+                except EditorBridgeError as e:
+                    if not _is_game_transport_failure(e):
+                        raise
+                    print("  [note] clear-logs skipped: previous game process "
+                          "already gone (new boot starts with an empty "
+                          "collector)", file=sys.stderr)
+            # 3. Record the process-console boundary IMMEDIATELY before the
+            #    boot. The editor process is persistent, so its console
+            #    output accumulates across boots; slicing the post-boot
+            #    console read from this offset yields only the fresh boot's
+            #    lines (no cumulative pollution).
+            pre = client.rpc("logs.get",
+                            {"from": 0, "max_lines": 1, "source": "process"})
+            pre_payload = pre.get("result", pre)
+            console_offset = int(pre_payload.get("total_lines", 0) or 0)
+            # 4. Boot.
+            client.rpc("action.scene.play", {"path": args.scene})
+            # 5. Let the boot run.
+            time.sleep(args.wait)
+            # Wait for the game bridge to become reachable so the collector
+            # read does not fail on a slow boot (bridge_connected is the
+            # accurate reachability probe).
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                st = client.read_state() or {}
+                if (st.get("game", {}) or {}).get("bridge_connected"):
+                    break
+                time.sleep(1.0)
+            # 6. Read the fresh collector (bounded read-only retry, same as
+            #    `game logs`). A transport failure AFTER the retries means the
+            #    game crashed during boot (its bridge never came up) — the
+            #    exact case this command exists for. Fall back to the console
+            #    slice alone (it holds the full boot log, engine init onward)
+            #    instead of erroring out.
+            timeout = GAME_TIMEOUTS.get("logs", DEFAULT_TIMEOUT)
+            retries = 3
+            attempt = 0
+            collector_result = None
+            while True:
+                try:
+                    collector_result = client.rpc(
+                        "game.get_godot_logs",
+                        {"from": 0, "max_lines": args.max_lines, "tail": 0},
+                        timeout=timeout)
+                    break
+                except EditorBridgeError as e:
+                    if _is_game_transport_failure(e) and attempt < retries:
+                        attempt += 1
+                        print("  [retry] fresh-boot-logs collector read "
+                              "(transport, attempt %d/%d) — %s"
+                              % (attempt, retries, e), file=sys.stderr)
+                        time.sleep(min(0.5 * attempt, 1.5))
+                        continue
+                    if _is_game_transport_failure(e):
+                        print("  [note] collector read failed (game likely "
+                              "crashed during boot); returning the console "
+                              "slice alone", file=sys.stderr)
+                        collector_result = {"result": {"messages": [],
+                                                     "total_lines": 0}}
+                        break
+                    _handle_game_error(e)
+            # 7. Read ONLY the console lines appended since the boot.
+            console_result = client.rpc(
+                "logs.get",
+                {"from": console_offset, "max_lines": 5000,
+                 "source": "process"},
+                timeout=timeout)
+            # Both rpc responses nest the payload under "result"; unwrap it
+            # (fall back to the whole dict for older bridges).
+            collector_payload = collector_result.get(
+                "result", collector_result)
+            console_payload = console_result.get("result", console_result)
+            print(json.dumps(
+                _merge_logs(collector_payload, console_payload), indent=2))
 
         elif args.command == "suite-result":
             print(json.dumps(client.suite_result(args.path), indent=2))
