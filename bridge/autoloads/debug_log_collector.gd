@@ -8,6 +8,19 @@ extends Logger
 ## is protected by _mutex. Pending push notifications are flushed on the main
 ## thread by DebugBridge._poll_socket() calling flush_pending().
 
+## Shared-registry seam: the EarlyLogCollector autoload (position 1) creates and
+## registers the collector in its _init() — before DebugBridge (a later
+## autoload) runs — and stores it here so DebugBridge can REUSE the same
+## instance instead of creating a second one. A fresh process has no shared
+## collector, so DebugBridge falls back to creating its own.
+static var _shared: DebugLogCollector = null
+
+static func set_shared(collector: DebugLogCollector) -> void:
+	_shared = collector
+
+static func get_shared() -> DebugLogCollector:
+	return _shared
+
 var _messages: Array[String] = []
 var _max_lines: int = 5000
 var _mutex: Mutex
